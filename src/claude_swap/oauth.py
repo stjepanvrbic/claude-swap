@@ -123,7 +123,7 @@ def format_monthly_reset() -> str:
         reset = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     else:
         reset = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    return reset.strftime(f"%b {reset.day}")
+    return f"{reset.strftime('%b')} {reset.day}"
 
 
 def format_reset(resets_at: str) -> tuple[str, str]:
