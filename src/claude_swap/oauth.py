@@ -116,6 +116,16 @@ def build_token_status(credentials: str) -> str | None:
     return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
 
 
+def format_monthly_reset() -> str:
+    """Return the first day of next month as a short local date string (e.g. 'Jun 1')."""
+    now = datetime.now(timezone.utc).astimezone()
+    if now.month == 12:
+        reset = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        reset = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    return reset.strftime(f"%b {reset.day}")
+
+
 def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
@@ -157,6 +167,18 @@ def request_usage_data(access_token: str) -> dict:
         return json.loads(resp.read().decode())
 
 
+def request_enterprise_usage_data(access_token: str, org_uuid: str) -> dict:
+    """Request usage data from the claude.ai organization usage API."""
+    url = f"https://claude.ai/api/organizations/{org_uuid}/usage"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": "claude-swap/1.0",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode())
+
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI."""
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))
@@ -177,6 +199,18 @@ def build_usage_result(data: dict) -> dict | None:
             d7_entry["countdown"], d7_entry["clock"] = format_reset(d7["resets_at"])
         result["seven_day"] = d7_entry
 
+    eu = data.get("extra_usage")
+    if eu and eu.get("is_enabled"):
+        spend_entry: dict = {
+            "used": float(eu["used_credits"]) / 100,
+            "limit": float(eu["monthly_limit"]) / 100,
+            "pct": float(eu["utilization"]),
+            "currency": eu.get("currency", "USD"),
+        }
+        if eu.get("resets_at"):
+            spend_entry["countdown"], spend_entry["clock"] = format_reset(eu["resets_at"])
+        result["spend"] = spend_entry
+
     return result if result else None
 
 
@@ -195,11 +229,14 @@ def fetch_usage_for_account(
     email: str,
     credentials: str,
     is_active: bool,
+    org_uuid: str = "",
     persist_credentials: Callable[[str, str, str], None] | None = None,
 ) -> dict | None:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
     Active accounts are never refreshed — Claude Code owns those credentials.
+    Uses the claude.ai organization endpoint for enterprise accounts (org_uuid set),
+    falling back to the Anthropic OAuth usage endpoint for personal/Pro accounts.
     """
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
@@ -220,9 +257,25 @@ def fetch_usage_for_account(
             oauth = extract_oauth_data(working_credentials) or oauth
             access_token = oauth.get("accessToken") or access_token
 
+    def _fetch(token: str) -> dict:
+        if org_uuid:
+            try:
+                return request_enterprise_usage_data(token, org_uuid)
+            except Exception:
+                _logger.debug("Enterprise usage endpoint failed, falling back to standard")
+        return request_usage_data(token)
+
+    def _build(data: dict) -> dict | None:
+        result = build_usage_result(data)
+        if result and org_uuid:
+            spend = result.get("spend")
+            if spend and "clock" not in spend:
+                spend["reset_date"] = format_monthly_reset()
+        return result
+
     try:
-        data = request_usage_data(access_token)
-        return build_usage_result(data)
+        data = _fetch(access_token)
+        return _build(data)
     except urllib.error.HTTPError as e:
         _logger.debug("Usage fetch failed: %r", e)
         if (
@@ -246,8 +299,8 @@ def fetch_usage_for_account(
             return None
 
         try:
-            data = request_usage_data(new_token)
-            return build_usage_result(data)
+            data = _fetch(new_token)
+            return _build(data)
         except Exception as retry_error:
             _logger.debug("Usage fetch failed after refresh: %r", retry_error)
             return None

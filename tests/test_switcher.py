@@ -466,7 +466,7 @@ class TestListAccountsUsage:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
-        def mock_fetch(account_num, email, credentials, is_active, persist_credentials):
+        def mock_fetch(account_num, email, credentials, is_active, org_uuid="", persist_credentials=None):
             # Simulate a refresh on the inactive account only.
             if not is_active:
                 persist_credentials(account_num, email, refreshed_creds)

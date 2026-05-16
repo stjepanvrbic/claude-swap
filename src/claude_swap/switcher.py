@@ -1022,7 +1022,7 @@ class ClaudeAccountSwitcher:
         def fetch(
             account_info: tuple[int, str, str, str, bool, str]
         ) -> dict | str | None:
-            num, email, _, _, is_active, creds = account_info
+            num, email, _, org_uuid, is_active, creds = account_info
             if not creds or not oauth.extract_access_token(creds):
                 return "no credentials"
 
@@ -1033,6 +1033,7 @@ class ClaudeAccountSwitcher:
             return oauth.fetch_usage_for_account(
                 str(num), email, creds,
                 is_active=is_active,
+                org_uuid=org_uuid,
                 persist_credentials=persist,
             )
 
@@ -1062,9 +1063,20 @@ class ClaudeAccountSwitcher:
             elif usage is None:
                 print(f"     {dimmed('usage unavailable')}")
             else:
+                lines = []
+                spend = usage.get("spend")
+                if spend:
+                    used = spend["used"]
+                    limit = spend["limit"]
+                    pct = spend["pct"]
+                    if "clock" in spend:
+                        lines.append(f"$$: {pct:>3.0f}%   resets {spend['clock']:<12}  ${used:,.2f} / ${limit:,.2f}")
+                    elif "reset_date" in spend:
+                        lines.append(f"$$: {pct:>3.0f}%   resets {spend['reset_date']:<12}  ${used:,.2f} / ${limit:,.2f}")
+                    else:
+                        lines.append(f"$$: {pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}")
                 h5 = usage.get("five_hour")
                 d7 = usage.get("seven_day")
-                lines = []
                 if h5:
                     if "clock" in h5:
                         lines.append(f"5h: {h5['pct']:>3.0f}%   resets {h5['clock']:<12}  in {h5['countdown']}")
@@ -1149,6 +1161,35 @@ class ClaudeAccountSwitcher:
                 f"({current_email} {muted(f'[{tag}]')})"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
+            creds = self._read_credentials() or ""
+            if creds and oauth.extract_access_token(creds):
+                usage = oauth.fetch_usage_for_account(
+                    account_num, current_email, creds,
+                    is_active=True,
+                    org_uuid=current_org_uuid,
+                )
+                if usage:
+                    lines = []
+                    spend = usage.get("spend")
+                    if spend:
+                        used = spend["used"]
+                        limit = spend["limit"]
+                        pct = spend["pct"]
+                        if "clock" in spend:
+                            lines.append(f"${used:,.2f} / ${limit:,.2f}  ·  {pct:.1f}% used   resets {spend['clock']:<12}  in {spend['countdown']}")
+                        else:
+                            lines.append(f"${used:,.2f} / ${limit:,.2f}  ·  {pct:.1f}% used")
+                    h5 = usage.get("five_hour")
+                    d7 = usage.get("seven_day")
+                    if h5:
+                        suffix = f"   resets {h5['clock']:<12}  in {h5['countdown']}" if "clock" in h5 else ""
+                        lines.append(f"5h: {h5['pct']:>3.0f}%{suffix}")
+                    if d7:
+                        suffix = f"   resets {d7['clock']:<12}  in {d7['countdown']}" if "clock" in d7 else ""
+                        lines.append(f"7d: {d7['pct']:>3.0f}%{suffix}")
+                    for j, line in enumerate(lines):
+                        connector = "└" if j == len(lines) - 1 else "├"
+                        print(f"  {dimmed(connector)} {muted(line)}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
 
