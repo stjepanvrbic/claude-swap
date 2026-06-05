@@ -23,6 +23,12 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     ``security`` for the live login). Redirect ``$HOME`` to a throwaway dir unless
     the test already uses ``temp_home`` (which sets its own). Runs first (autouse).
 
+    Exempt the ``tmp_keychain`` fixture too: the macOS-CI integration tests that
+    use it drive the real ``security`` CLI (``default-keychain`` /
+    ``list-keychains``), which needs the real ``$HOME`` to locate
+    ``~/Library/Keychains``. An isolated ``$HOME`` makes those commands fail. The
+    fixture itself swaps the default keychain to a throwaway one and restores it.
+
     Always neutralize ``CLAUDE_CONFIG_DIR`` and ``XDG_DATA_HOME`` (even for
     ``temp_home`` tests): both bypass ``$HOME`` in path resolution
     (``paths.get_global_config_path``/``get_backup_root``), so a developer with
@@ -34,6 +40,8 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
+    if "tmp_keychain" in request.fixturenames:
+        return  # real-keychain integration tests need the real $HOME
     safe_home = tmp_path_factory.mktemp("isolated_home")
     (safe_home / ".claude").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HOME", str(safe_home))
