@@ -37,6 +37,12 @@ class SwitchError(ClaudeSwitchError):
     pass
 
 
+class SessionError(ClaudeSwitchError):
+    """Error setting up or launching a session-mode profile."""
+
+    pass
+
+
 class LockError(ClaudeSwitchError):
     """Error acquiring lock."""
 

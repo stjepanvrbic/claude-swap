@@ -19,6 +19,7 @@ from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
     CredentialWriteError,
+    SessionError,
     SwitchError,
     ValidationError,
 )
@@ -375,6 +376,22 @@ class ClaudeAccountSwitcher:
             except Exception as e:
                 self._logger.warning(f"Failed to write credentials to Keychain: {e}")
                 raise
+        # Backup credentials changed (re-login via --add-account, --add-token,
+        # import, switch backing up, or a usage-refresh rotation): a session
+        # profile seeded from the old credentials may now hold a stale or
+        # rotated-out token that still passes the local reuse check. Drop the
+        # profile's credential material so the next `cswap run` re-bootstraps
+        # from this fresh backup (history is preserved). A LIVE session keeps
+        # its own copy untouched — claude manages it; pulling credentials out
+        # from under a running process would be worse than the drift caveat —
+        # but gets a stale marker so setup_session re-bootstraps it once it
+        # is no longer live, instead of trusting the local reuse check.
+        if self._live_session_pids(account_num, email):
+            from claude_swap.session import mark_session_stale
+
+            mark_session_stale(self._session_dir(account_num, email))
+        else:
+            self._invalidate_session_credentials(account_num, email)
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         """Delete account credentials from backup.
@@ -404,11 +421,23 @@ class ClaudeAccountSwitcher:
                     self._logger.warning(f"Failed to delete credentials from Keychain: {e}")
 
     def _delete_account_files(self, account_num: str, email: str) -> None:
-        """Delete all backup files for an account (credentials + config)."""
+        """Delete all backup files for an account (credentials + config).
+
+        Single chokepoint for every path that removes or displaces a slot
+        (remove_account, add_account/add_token slot overwrite & migration):
+        refuses while a session-mode claude is live against the slot, and
+        removes the slot's session profile alongside the backups so a stale
+        profile can never outlive its account.
+
+        Raises:
+            SessionError: a live session-mode instance is using this account.
+        """
+        self._ensure_no_live_session(account_num, email, "the operation")
         self._delete_account_credentials(account_num, email)
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():
             config_file.unlink()
+        self._delete_session_profile(account_num, email)
 
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
@@ -443,6 +472,115 @@ class ClaudeAccountSwitcher:
         config_file.write_text(config, encoding="utf-8")
         if sys.platform != "win32":
             os.chmod(config_file, 0o600)
+
+    # -- public accessors for session mode (claude_swap.session) ---------
+
+    def resolve_account(self, identifier: str) -> tuple[str, str, str]:
+        """Resolve NUM|EMAIL to (account_num, email, organizationUuid).
+
+        Unlike switch_to/remove_account, ambiguity is a hard error rather
+        than an interactive prompt: session mode ends in an exec, so callers
+        need a deterministic resolution.
+
+        Raises:
+            AccountNotFoundError: identifier doesn't match any account.
+            ConfigError: email matches multiple accounts.
+        """
+        self._get_sequence_data_migrated()
+        account_num = self._resolve_account_identifier(identifier)
+        if not account_num:
+            raise AccountNotFoundError(
+                f"No account found with identifier: {identifier}"
+            )
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(account_num)
+        if not record:
+            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        return (
+            account_num,
+            record.get("email", ""),
+            record.get("organizationUuid", "") or "",
+        )
+
+    def read_account_credentials(self, account_num: str, email: str) -> str:
+        """Public wrapper for session bootstrap. Empty string when missing."""
+        return self._read_account_credentials(account_num, email)
+
+    def write_account_credentials(
+        self, account_num: str, email: str, credentials: str
+    ) -> None:
+        """Public wrapper for session bootstrap.
+
+        Takes NO lock: the caller is expected to hold ``self.lock_file``
+        already. Never combine with the locking persist callback in
+        list_accounts() — FileLock is not re-entrant across instances in one
+        process (see the v0.7.3 deadlock history).
+        """
+        self._write_account_credentials(account_num, email, credentials)
+
+    def read_account_config(self, account_num: str, email: str) -> str:
+        """Public wrapper for session bootstrap. Empty string when missing."""
+        return self._read_account_config(account_num, email)
+
+    # -- session profile lifecycle ----------------------------------------
+
+    def _session_dir(self, account_num: str, email: str) -> Path:
+        from claude_swap.session import session_dir_for
+
+        return session_dir_for(self.backup_dir, account_num, email)
+
+    def _live_session_pids(self, account_num: str, email: str) -> list[int]:
+        """PIDs of Claude instances running against an account's session profile."""
+        from claude_swap.session import live_sessions_for
+
+        return [s.pid for s in live_sessions_for(self._session_dir(account_num, email))]
+
+    def _ensure_no_live_session(self, account_num: str, email: str, action: str) -> None:
+        """Refuse a destructive operation while a session-mode claude is live."""
+        pids = self._live_session_pids(account_num, email)
+        if pids:
+            raise SessionError(
+                f"Account-{account_num} ({email}) has a live session-mode Claude "
+                f"instance (PID {', '.join(map(str, pids))}). "
+                f"Exit it first, then retry {action}."
+            )
+
+    def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
+        """Drop a session profile's credential material, keeping its history.
+
+        The next `cswap run` fails the reuse check and re-bootstraps from
+        backup; the bootstrap merges .claude.json, so the profile's own
+        projects/history survive. Used when backup credentials change under
+        an existing profile (e.g. --import --force).
+        """
+        from claude_swap.session import STALE_MARKER, delete_macos_keychain_entry
+
+        session_dir = self._session_dir(account_num, email)
+        if not session_dir.exists():
+            return
+        delete_macos_keychain_entry(session_dir)
+        (session_dir / ".credentials.json").unlink(missing_ok=True)
+        (session_dir / STALE_MARKER).unlink(missing_ok=True)
+        self._logger.info(
+            f"Invalidated session credentials for account {account_num}"
+        )
+
+    def _delete_session_profile(self, account_num: str, email: str) -> None:
+        """Remove an account's session profile dir and its keychain entry.
+
+        Keychain first: the hashed service name is derived from the dir path
+        and can't be recomputed once the dir is gone.
+        """
+        from claude_swap.session import delete_macos_keychain_entry
+
+        session_dir = self._session_dir(account_num, email)
+        if not session_dir.exists():
+            return
+        delete_macos_keychain_entry(session_dir)
+        shutil.rmtree(session_dir, ignore_errors=True)
+        self._logger.info(
+            f"Removed session profile for account {account_num} at {session_dir}"
+        )
 
     def _init_sequence_file(self) -> None:
         """Initialize sequence.json if it doesn't exist."""
@@ -1023,6 +1161,10 @@ class ClaudeAccountSwitcher:
         email = account_info.get("email")
         active_account = data.get("activeAccountNumber")
 
+        # Check before the confirmation prompt (better UX); the chokepoint in
+        # _delete_account_files re-checks as a safety net for all paths.
+        self._ensure_no_live_session(account_num, email, "--remove-account")
+
         if str(active_account) == account_num:
             warning(f"Warning: Account-{account_num} ({email}) is currently active")
 
@@ -1095,9 +1237,17 @@ class ClaudeAccountSwitcher:
                 with FileLock(self.lock_file):
                     self._write_account_credentials(acct_num, acct_email, new_creds)
 
+            # An account running in session mode is "inactive" here but live
+            # in its own config dir, where claude manages the token. Treat it
+            # like the active account (no proactive refresh / 401-retry):
+            # refreshing the backup copy could rotate the refresh token out
+            # from under the live session. Worst case its usage shows as
+            # unavailable until the session exits.
+            has_live_session = bool(self._live_session_pids(str(num), email))
+
             return oauth.fetch_usage_for_account(
                 str(num), email, creds,
-                is_active=is_active,
+                is_active=is_active or has_live_session,
                 persist_credentials=persist,
             )
 
@@ -1397,6 +1547,26 @@ class ClaudeAccountSwitcher:
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
+        # Session-mode drift warning (warn, never block): switching the
+        # default login to an account that also has a live session profile
+        # puts the same refresh token in two config dirs — if the server
+        # rotates it, one copy goes stale.
+        pre_data = self._get_sequence_data() or {}
+        pre_email = (
+            pre_data.get("accounts", {}).get(target_account, {}).get("email", "")
+        )
+        if pre_email:
+            pids = self._live_session_pids(target_account, pre_email)
+            if pids:
+                warning(
+                    f"Account-{target_account} ({pre_email}) has a live session-mode "
+                    f"Claude instance (PID {', '.join(map(str, pids))}). Running the "
+                    "same account as both the default login and a session can make "
+                    "one copy's token go stale if the server rotates it. If the "
+                    "session later fails to authenticate, exit it and re-run "
+                    f"'cswap run {target_account}'."
+                )
+
         with FileLock(self.lock_file):
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
@@ -1641,6 +1811,31 @@ class ClaudeAccountSwitcher:
         legacy = get_legacy_backup_root()
         legacy_distinct = legacy != self.backup_dir
 
+        # Refuse while any session-mode claude is running: purging would pull
+        # its profile (and keychain entry) out from under a live process.
+        sessions_root = self.backup_dir / "sessions"
+        session_dirs = (
+            [d for d in sessions_root.iterdir() if d.is_dir()]
+            if sessions_root.is_dir()
+            else []
+        )
+        from claude_swap.session import live_sessions_for
+
+        live = {}
+        for d in session_dirs:
+            pids = [s.pid for s in live_sessions_for(d)]
+            if pids:
+                live[d.name] = pids
+        if live:
+            details = "; ".join(
+                f"{name} (PID {', '.join(map(str, pids))})"
+                for name, pids in live.items()
+            )
+            raise SessionError(
+                f"Live session-mode Claude instance(s) found: {details}. "
+                "Exit them first, then retry --purge."
+            )
+
         warning("This will remove ALL claude-swap data from your system:")
         print(f"  - Backup directory: {self.backup_dir}")
         if legacy_distinct and legacy.exists():
@@ -1649,6 +1844,8 @@ class ClaudeAccountSwitcher:
             print("  - All stored account credential files")
         else:
             print("  - All stored account credentials from the macOS Keychain")
+        if session_dirs:
+            print("  - All session profiles and their Keychain entries")
         print()
         print(dimmed("Note: This does NOT affect your current Claude Code login."))
         print()
@@ -1704,6 +1901,18 @@ class ClaudeAccountSwitcher:
                     # Best-effort cleanup of any pre-migration keyring entries left
                     # behind if the keyring → security migration never completed.
                     _sweep_legacy_keyring(usernames, removed_items)
+
+        # Session-profile keychain entries must go BEFORE the backup dir:
+        # the hashed service names are derived from the dir paths and can't
+        # be recomputed once the directories are deleted.
+        if session_dirs:
+            from claude_swap.session import delete_macos_keychain_entry
+
+            for d in session_dirs:
+                delete_macos_keychain_entry(d)
+            removed_items.append(
+                f"Session profiles: {', '.join(d.name for d in session_dirs)}"
+            )
 
         # Remove backup directory
         if self.backup_dir.exists():

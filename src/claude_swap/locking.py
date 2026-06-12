@@ -19,20 +19,24 @@ from claude_swap.exceptions import LockError
 class FileLock:
     """Cross-process file lock using platform-specific APIs."""
 
-    def __init__(self, lock_path: Path):
+    def __init__(self, lock_path: Path, timeout: float = 10.0):
         self.lock_path = lock_path
+        self.timeout = timeout
         self._lock_file: IO | None = None
         self._locked = False
 
-    def acquire(self, timeout: float = 10.0) -> bool:
+    def acquire(self, timeout: float | None = None) -> bool:
         """Acquire exclusive lock with timeout.
 
         Args:
-            timeout: Maximum seconds to wait for lock.
+            timeout: Maximum seconds to wait for lock. Defaults to the
+                timeout given at construction.
 
         Returns:
             True if lock acquired, False if timeout.
         """
+        if timeout is None:
+            timeout = self.timeout
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock_file = open(self.lock_path, "w")
 

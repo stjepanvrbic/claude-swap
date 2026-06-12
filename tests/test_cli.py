@@ -366,3 +366,97 @@ class TestCLICommands:
         )
         assert "--add-token" in result.stdout
         assert "--email" in result.stdout
+
+
+class TestRunCommand:
+    """`cswap run` pre-dispatch: parsing, forwarding, and dispatch."""
+
+    def _dispatch(self, argv: list[str]):
+        """Run cli.main() with a fake SessionManager; returns recorded calls."""
+        calls = []
+
+        class FakeSessionManager:
+            def __init__(self, switcher):
+                calls.append(("init", switcher))
+
+            def run(self, identifier, claude_args, share=True):
+                calls.append(("run", identifier, claude_args, share))
+
+        with patch("claude_swap.session.SessionManager", FakeSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000), \
+             patch.object(sys, "argv", ["claude-swap", *argv]):
+            cli.main()
+        return calls
+
+    def test_run_dispatches_with_defaults(self):
+        calls = self._dispatch(["run", "2"])
+        assert ("run", "2", [], True) in calls
+
+    def test_run_by_email(self):
+        calls = self._dispatch(["run", "user@example.com"])
+        assert ("run", "user@example.com", [], True) in calls
+
+    def test_no_share_flag(self):
+        calls = self._dispatch(["run", "2", "--no-share"])
+        assert ("run", "2", [], False) in calls
+
+    def test_tail_forwarded_verbatim(self):
+        calls = self._dispatch(["run", "2", "--", "--resume", "--model", "x"])
+        assert ("run", "2", ["--resume", "--model", "x"], True) in calls
+
+    def test_tail_may_contain_run_flags(self):
+        """Args after `--` are NOT parsed by cswap, even if they look like ours."""
+        calls = self._dispatch(["run", "2", "--", "--no-share"])
+        assert ("run", "2", ["--no-share"], True) in calls
+
+    def test_run_without_account_errors(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "run"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+        assert "NUM|EMAIL" in capsys.readouterr().err
+
+    def test_run_unknown_flag_errors(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "run", "2", "--bogus"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 2
+
+    def test_run_help(self, capsys):
+        with patch.object(sys, "argv", ["claude-swap", "run", "--help"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        out = capsys.readouterr().out
+        assert "--no-share" in out
+        assert "this terminal only" in out
+
+    def test_main_help_mentions_run(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "claude_swap", "--help"],
+            capture_output=True,
+            text=True,
+            env=_subprocess_env(),
+        )
+        assert "run 2" in result.stdout
+
+    def test_session_error_exits_cleanly(self, capsys):
+        class FailingSessionManager:
+            def __init__(self, switcher):
+                pass
+
+            def run(self, identifier, claude_args, share=True):
+                from claude_swap.exceptions import SessionError
+
+                raise SessionError("boom")
+
+        with patch("claude_swap.session.SessionManager", FailingSessionManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch("os.geteuid", return_value=1000), \
+             patch.object(sys, "argv", ["claude-swap", "run", "2"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 1
+        assert "boom" in capsys.readouterr().err

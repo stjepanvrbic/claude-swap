@@ -69,6 +69,19 @@ cswap --switch-to user@example.com
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
+### Run an account in one terminal (session mode) `[experimental]`
+
+Run two accounts at the same time: launch Claude Code as a specific account in the current terminal only, while every other terminal and the VS Code extension stay on your default account.
+
+```bash
+cswap run 2                     # launch Claude Code as account 2, here only
+cswap run user@example.com      # by email
+cswap run 2 -- --resume         # everything after '--' is forwarded to claude
+cswap run 2 --no-share          # don't share your ~/.claude customizations
+```
+
+Your `~/.claude` customizations (settings, keybindings, CLAUDE.md, skills, commands, agents) are shared into the session by default — use `--no-share` for a bare profile. Conversation history stays per-account. Note that session mode isolates the *account*, not your files: two Claude instances in the same repo still edit the same working tree.
+
 ### Refresh expired tokens
 
 If an account's token expires, log back into Claude Code with that account and re-run:
@@ -82,6 +95,7 @@ This will update the stored credentials without creating a duplicate.
 ### Other commands
 
 ```bash
+cswap run 2                     # Run an account in this terminal only (session mode)
 cswap --list                    # Show all accounts with 5h/7d usage and reset times
 cswap --status                  # Show current account
 cswap --add-account --slot 3    # Add account to a specific slot (prompts before overwrite)
@@ -109,6 +123,8 @@ cswap --purge                   # Remove all claude-swap data
 | Windows | File-based (inside the backup directory, under `credentials/`) | `~/.claude-swap-backup/` |
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
+
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location. Data from older installs under `~/.claude-swap-backup/` is migrated automatically on first run.
 

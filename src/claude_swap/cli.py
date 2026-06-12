@@ -12,8 +12,88 @@ from claude_swap.printer import dimmed, error, muted
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
+def _run_command(argv: list[str]) -> None:
+    """Handle `cswap run NUM|EMAIL [--no-share] [-- <claude args>]`.
+
+    Pre-dispatched before the main parser is built: a positional subcommand
+    can't coexist with main()'s required mutually-exclusive flag group, and
+    this keeps the existing parser untouched. Limitation: `run` must be the
+    first argument (`cswap --debug run 2` is not supported; use
+    `cswap run 2 --debug`).
+
+    On POSIX this execs claude and never returns; on Windows it exits with
+    claude's return code. Either way the post-dispatch update check in
+    main() is unreachable, which is intended.
+    """
+    # Everything after the first `--` is forwarded to claude verbatim.
+    if "--" in argv:
+        split = argv.index("--")
+        head, tail = argv[:split], argv[split + 1 :]
+    else:
+        head, tail = argv, []
+
+    parser = argparse.ArgumentParser(
+        prog="cswap run",
+        description=(
+            "[EXPERIMENTAL] Launch Claude Code as a stored account in this "
+            "terminal only (the default login and other terminals are "
+            "unaffected)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap run 2
+  cswap run user@example.com
+  cswap run 2 --no-share
+  cswap run 2 -- --resume
+        """,
+    )
+    parser.add_argument(
+        "account",
+        metavar="NUM|EMAIL",
+        help="Account to run (number or email)",
+    )
+    parser.add_argument(
+        "--no-share",
+        action="store_true",
+        help=(
+            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents "
+            "from ~/.claude into the session profile (and remove previously "
+            "shared items)"
+        ),
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    args = parser.parse_args(head)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
+        from claude_swap.session import SessionManager
+
+        SessionManager(switcher).run(args.account, tail, share=not args.no_share)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        _run_command(sys.argv[2:])
+        return  # only reachable in tests where exec/exit is mocked
+
     parser = argparse.ArgumentParser(
         description="Multi-Account Switcher for Claude Code",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -28,6 +108,8 @@ Examples:
   %(prog)s --switch
   %(prog)s --switch-to 2
   %(prog)s --switch-to user@example.com
+  %(prog)s run 2                            # run account 2 in this terminal only
+  %(prog)s run 2 -- --resume                # forward args after '--' to claude
   %(prog)s --remove-account user@example.com
   %(prog)s --status
   %(prog)s --purge

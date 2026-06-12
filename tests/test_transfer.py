@@ -1138,3 +1138,67 @@ class TestExportSkipsBrokenSlots:
         assert [a["email"] for a in envelope["accounts"]] == ["bob@example.com"]
         # Warning is on stderr.
         assert "Skipping Account-1" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Session-mode interaction
+# ---------------------------------------------------------------------------
+
+
+class TestImportSessionInvalidation:
+    def _reexport_with_marker(self, s, temp_home: Path) -> Path:
+        out = temp_home / "alice.cswap"
+        export_accounts(s, str(out), account="1")
+        env = json.loads(out.read_text())
+        env["accounts"][0]["credentials"]["_marker"] = "NEW"
+        out.write_text(json.dumps(env))
+        return out
+
+    def test_force_overwrite_invalidates_session_credentials(
+        self, temp_home: Path, capsys
+    ):
+        from claude_swap.session import session_dir_for
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a")
+        out = self._reexport_with_marker(s, temp_home)
+
+        session_dir = session_dir_for(s.backup_dir, "1", "alice@example.com")
+        session_dir.mkdir(parents=True)
+        (session_dir / ".credentials.json").write_text("pre-import creds")
+        (session_dir / ".claude.json").write_text('{"projects": {}}')
+
+        import_accounts(s, str(out), force=True)
+
+        # Credential material dropped → next `cswap run` re-bootstraps from
+        # the imported backup; profile history (.claude.json) survives.
+        assert not (session_dir / ".credentials.json").exists()
+        assert (session_dir / ".claude.json").exists()
+
+    def test_force_overwrite_warns_but_keeps_live_session(
+        self, temp_home: Path, capsys
+    ):
+        import os as _os
+
+        from claude_swap.session import session_dir_for
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com", "org-a")
+        out = self._reexport_with_marker(s, temp_home)
+
+        session_dir = session_dir_for(s.backup_dir, "1", "alice@example.com")
+        pid_dir = session_dir / "sessions"
+        pid_dir.mkdir(parents=True)
+        (pid_dir / f"{_os.getpid()}.json").write_text(
+            json.dumps({"pid": _os.getpid()})
+        )
+        (session_dir / ".credentials.json").write_text("pre-import creds")
+
+        import_accounts(s, str(out), force=True)
+
+        captured = capsys.readouterr()
+        assert "live" in captured.err
+        # Live session untouched; import itself still completed.
+        assert (session_dir / ".credentials.json").read_text() == "pre-import creds"
+        alice = s._read_account_credentials("1", "alice@example.com")
+        assert json.loads(alice)["_marker"] == "NEW"
