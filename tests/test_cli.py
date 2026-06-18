@@ -134,6 +134,48 @@ class TestCLI:
             show_token_status=True,
         )
 
+    def test_best_flag_requires_switch(self, capsys):
+        """--best should only be accepted alongside --switch."""
+        with patch.object(sys, "argv", ["claude-swap", "--best", "--list"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--best and --skip-exhausted can only be used with --switch" in capsys.readouterr().err
+
+    def test_skip_exhausted_flag_requires_switch(self, capsys):
+        """--skip-exhausted should only be accepted alongside --switch."""
+        with patch.object(sys, "argv", ["claude-swap", "--skip-exhausted", "--list"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--best and --skip-exhausted can only be used with --switch" in capsys.readouterr().err
+
+    def test_switch_flags_forwarded(self):
+        """--switch --best --skip-exhausted forwards both flags to switch()."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch", "--best", "--skip-exhausted"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(
+            best=True, skip_exhausted=True,
+        )
+
+    def test_plain_switch_passes_false_flags(self):
+        """Bare --switch forwards best=False, skip_exhausted=False."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(
+            best=False, skip_exhausted=False,
+        )
+
     def test_slot_flag_requires_add_account(self, capsys):
         """--slot should only be accepted alongside --add-account or --add-token."""
         with patch.object(sys, "argv", ["claude-swap", "--list", "--slot", "3"]):
