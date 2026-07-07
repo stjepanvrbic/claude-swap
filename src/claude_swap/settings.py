@@ -24,6 +24,8 @@ from claude_swap.exceptions import ConfigError
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
+AUTOSWITCH_STRATEGIES = ("best", "fable-best")
+SWITCH_STRATEGIES = ("best", "next-available", "fable-best")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -44,7 +46,7 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # reserved for future strategies; only "best" in v1
+    strategy: str = "best"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
 
@@ -98,7 +100,8 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             help="A target must sit this many pct below the threshold",
         ),
         SettingSpec(
-            "autoswitch", "strategy", "strategy", "choice", choices=("best",),
+            "autoswitch", "strategy", "strategy", "choice",
+            choices=AUTOSWITCH_STRATEGIES,
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -346,6 +349,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("threshold", "threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
+        ("strategy", "strategy"),
         ("include_api_key_accounts", "include_api_key_accounts"),
     ):
         value = getattr(args, attr, None)

@@ -3225,8 +3225,11 @@ class TestUsageAwareSwitch:
         }))
 
     @staticmethod
-    def _usage(pct: float) -> dict:
-        return {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
+    def _usage(pct: float, fable_pct: float | None = None) -> dict:
+        usage = {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
+        if fable_pct is not None:
+            usage["scoped"] = [{"name": "Fable", "pct": fable_pct}]
+        return usage
 
     def test_best_switches_to_more_headroom(self, temp_home: Path):
         s = self._setup(temp_home)
@@ -3359,6 +3362,96 @@ class TestUsageAwareSwitch:
         out = capsys.readouterr().out
         assert "some usage is unavailable" in out
         assert "All accounts are at their 5h/7d limit" not in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
+
+    def test_fable_best_switches_to_most_fable_headroom(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._usage(50, fable_pct=70),  # Fable headroom 30
+            "2": self._usage(10, fable_pct=50),  # Fable headroom 50
+            "3": self._usage(20, fable_pct=20),  # Fable headroom 80
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="fable-best")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_fable_best_skips_5h_exhausted_candidate(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._usage(50, fable_pct=70),
+            "2": self._usage(100, fable_pct=0),  # Best Fable, unusable 5h/7d.
+            "3": self._usage(20, fable_pct=40),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="fable-best")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_fable_best_ties_break_by_5h_headroom(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._usage(50, fable_pct=80),
+            "2": self._usage(40, fable_pct=20),  # Fable 80, rate 60.
+            "3": self._usage(10, fable_pct=20),  # Fable 80, rate 90.
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="fable-best")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_fable_best_current_exhausted_still_switches_to_viable_target(
+        self, temp_home: Path
+    ):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._usage(100, fable_pct=0),
+            "2": self._usage(50, fable_pct=50),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="fable-best")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_fable_best_missing_fable_data_stays(self, temp_home: Path, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {
+            "1": self._usage(50, fable_pct=50),
+            "2": self._usage(10),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(strategy="fable-best")
+
+        assert "Fable usage data" in capsys.readouterr().out
         assert s._get_sequence_data()["activeAccountNumber"] == 1
         mock_list.assert_not_called()
 

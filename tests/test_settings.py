@@ -29,6 +29,7 @@ def _args(**kwargs) -> argparse.Namespace:
         "threshold": None,
         "interval": None,
         "cooldown": None,
+        "strategy": None,
         "include_api_key_accounts": None,
     }
     defaults.update(kwargs)
@@ -83,6 +84,12 @@ class TestLoadSettings:
             json.dumps({"autoswitch": {"strategy": "chaos"}})
         )
         assert load_settings(tmp_path).strategy == "best"
+
+    def test_fable_best_strategy_is_supported(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "fable-best"}})
+        )
+        assert load_settings(tmp_path).strategy == "fable-best"
 
 
 class TestSaveSettings:
@@ -150,6 +157,9 @@ class TestSetUnsetSetting:
         with pytest.raises(ConfigError, match="true or false"):
             set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "falsy")
 
+    def test_set_accepts_fable_best_strategy(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.strategy", "fable-best") == "fable-best"
+
     def test_set_on_corrupt_file_raises_and_preserves_it(self, tmp_path: Path):
         settings_path(tmp_path).write_text("{not json")
         with pytest.raises(ConfigError, match="not valid JSON"):
@@ -209,3 +219,7 @@ class TestMergedWithCli:
             AutoSwitchSettings(), _args(include_api_key_accounts=True)
         )
         assert merged.include_api_key_accounts is True
+
+    def test_strategy_override(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="fable-best"))
+        assert merged.strategy == "fable-best"

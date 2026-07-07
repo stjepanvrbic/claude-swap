@@ -62,6 +62,28 @@ class TestAccountHeadroom:
         assert oauth.account_headroom({"five_hour": {"pct": None}}) is None
 
 
+class TestScopedModelHeadroom:
+    """Test scoped_model_headroom."""
+
+    def test_matches_model_name_case_insensitively(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 25.0}]}
+        assert oauth.scoped_model_headroom(usage, "fable") == 75.0
+
+    def test_duplicate_model_rows_use_binding_utilization(self):
+        usage = {
+            "scoped": [
+                {"name": "Fable", "pct": 25.0},
+                {"name": "Fable", "pct": 80.0},
+            ]
+        }
+        assert oauth.scoped_model_headroom(usage, "Fable") == 20.0
+
+    def test_absent_or_malformed_model_is_unknown(self):
+        assert oauth.scoped_model_headroom({"scoped": [{"name": "Opus", "pct": 10}]}, "Fable") is None
+        assert oauth.scoped_model_headroom({"scoped": [{"name": "Fable", "pct": None}]}, "Fable") is None
+        assert oauth.scoped_model_headroom(None, "Fable") is None
+
+
 class TestFormatReset:
     """Test format_reset."""
 

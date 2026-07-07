@@ -73,17 +73,18 @@ Not sure which one? `cswap list` is the dashboard — every account's 5-hour and
 cswap list
 ```
 
-Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
+Or let claude-swap auto-pick by usage — `cswap switch --strategy best` (most 5h/7d quota left), `--strategy next-available` (skip rate-limited accounts), or `--strategy fable-best` (prefer remaining Fable weekly headroom among accounts still usable on 5h/7d).
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
 ### Automatic switching
 
-Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
+Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working. With `--strategy fable-best`, the active Fable weekly window can also trigger the threshold and targets are ranked by Fable headroom:
 
 ```bash
 cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
+cswap auto --strategy fable-best # choose targets by Fable weekly headroom
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 ```
@@ -103,7 +104,7 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
-Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](#configuration)).
+Defaults like the threshold, cooldown, and strategy are configurable with `cswap config set autoswitch.threshold 80` and `cswap config set autoswitch.strategy fable-best` — flags override them (see [Configuration](#configuration)).
 
 </details>
 
@@ -209,6 +210,7 @@ Tool preferences live in `settings.json` in the backup root; `cswap config` read
 cswap config                              # list effective settings ("(default)" = not set)
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
+cswap config set autoswitch.strategy fable-best
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
@@ -241,6 +243,7 @@ Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable 
 cswap list --json                   # all accounts with usage/quota
 cswap status --json                 # current active account
 cswap switch --strategy best --json # switch, then report the result
+cswap switch --strategy fable-best --json
 cswap switch 2 --json
 ```
 

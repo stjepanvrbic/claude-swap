@@ -98,6 +98,8 @@ _FETCH_STAGGER_S = 0.25
 # Show a "· Xm ago" age note on displayed usage older than this. Below it the
 # data is essentially current (auto refreshes every tick; --list on demand).
 _USAGE_AGE_NOTE_S = 90.0
+FABLE_MODEL_NAME = "Fable"
+USAGE_AWARE_STRATEGIES = ("best", "next-available", "fable-best")
 
 
 def _format_usage_lines(usage: dict) -> list[str]:
@@ -1836,6 +1838,71 @@ class ClaudeAccountSwitcher:
             return None, "exhausted"
         return None, "stay"
 
+    def _select_fable_best_switchable(
+        self, current_num: str | None
+    ) -> tuple[str | None, str]:
+        """Decide the ``fable-best`` strategy target.
+
+        A candidate must have readable Fable scoped usage and readable 5h/7d
+        usage, and must not already be exhausted on the 5h/7d binding window.
+        Among viable candidates, prefer Fable headroom first and 5h/7d
+        headroom second. Ties resolve in favour of staying put.
+        """
+        data = self._get_sequence_data() or {}
+        others = [
+            str(n) for n in data.get("sequence", [])
+            if str(n) != str(current_num) and self._account_is_switchable(str(n))
+        ]
+        if not others:
+            return None, "none"
+
+        usage = self._usage_by_account()
+        current_usage = usage.get(str(current_num))
+        current_rate = oauth.account_headroom(
+            current_usage if isinstance(current_usage, dict) else None
+        )
+        current_fable = oauth.scoped_model_headroom(
+            current_usage if isinstance(current_usage, dict) else None,
+            FABLE_MODEL_NAME,
+        )
+        if current_rate is None or current_fable is None:
+            return None, "current-unavailable"
+
+        scored: list[tuple[tuple[float, float], str]] = []
+        known: list[tuple[float, float, str]] = []
+        unknown = False
+        for num in others:
+            value = usage.get(num)
+            candidate_usage = value if isinstance(value, dict) else None
+            rate_headroom = oauth.account_headroom(candidate_usage)
+            fable_headroom = oauth.scoped_model_headroom(
+                candidate_usage, FABLE_MODEL_NAME
+            )
+            if rate_headroom is None or fable_headroom is None:
+                unknown = True
+                continue
+            known.append((fable_headroom, rate_headroom, num))
+            if rate_headroom <= 0:
+                continue
+            scored.append(((fable_headroom, rate_headroom), num))
+
+        if not known:
+            return None, "no-comparison"
+        if not scored:
+            if unknown:
+                return None, "incomplete-comparison"
+            if current_rate <= 0:
+                return None, "exhausted"
+            return None, "stay"
+
+        best_score, best_num = max(scored, key=lambda t: t[0])
+        current_score = (current_fable, current_rate)
+        if current_rate <= 0 or best_score > current_score:
+            return best_num, ""
+        if unknown:
+            return None, "incomplete-comparison"
+        return None, "stay"
+
     def _build_list_payload(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str]],
@@ -2141,9 +2208,11 @@ class ClaudeAccountSwitcher:
         Args:
             strategy: Usage-aware target selection. ``"best"`` jumps to the
                   switchable account with the most remaining 5h/7d quota instead
-                  of advancing the rotation; ``"next-available"`` rotates to the
-                  next account, skipping any currently at its 5h/7d limit. ``None``
-                  (the default) performs a plain rotation.
+                  of advancing the rotation; ``"fable-best"`` prefers Fable
+                  weekly headroom among accounts still usable on 5h/7d;
+                  ``"next-available"`` rotates to the next account, skipping
+                  any currently at its 5h/7d limit. ``None`` (the default)
+                  performs a plain rotation.
 
         ``"best"`` only switches when it can prove another account has more
         remaining quota; if usage can't be fetched or no candidate is provably
@@ -2153,7 +2222,7 @@ class ClaudeAccountSwitcher:
         normal path (a live Claude login present); the fresh-machine path (no
         live login, e.g. right after --import) ignores them.
         """
-        strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
+        strategy_label = strategy if strategy in USAGE_AWARE_STRATEGIES else "rotation"
         warnings: list[str] = []
 
         if not self.sequence_file.exists():
@@ -2260,8 +2329,42 @@ class ClaudeAccountSwitcher:
         # Usage-aware "jump to most headroom". Only switches when another
         # account is provably better; otherwise stays put (never moves onto a
         # worse or unverifiable account). Bare `cswap --switch` rotates anyway.
-        if strategy == "best":
-            target, note = self._select_best_switchable(current_num)
+        if strategy in ("best", "fable-best"):
+            fable_strategy = strategy == "fable-best"
+            target, note = (
+                self._select_fable_best_switchable(current_num)
+                if fable_strategy
+                else self._select_best_switchable(current_num)
+            )
+            current_unavailable = (
+                "Current account Fable or 5h/7d usage is unavailable"
+                if fable_strategy
+                else "Current account usage is unavailable"
+            )
+            no_comparison = (
+                "No other account has Fable usage data to compare"
+                if fable_strategy
+                else "No other account has usage data to compare"
+            )
+            incomplete = (
+                "No account with known Fable usage has more remaining Fable headroom; "
+                "some usage is unavailable"
+                if fable_strategy
+                else (
+                    "No account with known usage has more remaining quota; "
+                    "some usage is unavailable"
+                )
+            )
+            already_best = (
+                "Already on the account with the most remaining Fable headroom"
+                if fable_strategy
+                else "Already on the account with the most remaining quota"
+            )
+            exhausted = (
+                "All accounts with known Fable usage are at their 5h/7d limit"
+                if fable_strategy
+                else "All accounts are at their 5h/7d limit"
+            )
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
                 return (
@@ -2274,12 +2377,12 @@ class ClaudeAccountSwitcher:
                         strategy=strategy_label, reason="usage-unavailable",
                         to_ref=current_ref,
                         message=(
-                            f"Current account usage is unavailable — staying on "
+                            f"{current_unavailable} - staying on "
                             f"Account-{current_num}."
                         ),
                     )
                 print(dimmed(
-                    f"Current account usage is unavailable — staying on "
+                    f"{current_unavailable} - staying on "
                     f"Account-{current_num}. Run cswap --switch to rotate."
                 ))
                 return None
@@ -2289,12 +2392,12 @@ class ClaudeAccountSwitcher:
                         strategy=strategy_label, reason="usage-unavailable",
                         to_ref=current_ref,
                         message=(
-                            f"No other account has usage data to compare — staying "
+                            f"{no_comparison} - staying "
                             f"on Account-{current_num}."
                         ),
                     )
                 print(dimmed(
-                    f"No other account has usage data to compare — staying on "
+                    f"{no_comparison} - staying on "
                     f"Account-{current_num}. Run cswap --switch to rotate."
                 ))
                 return None
@@ -2304,13 +2407,11 @@ class ClaudeAccountSwitcher:
                         strategy=strategy_label, reason="usage-unavailable",
                         to_ref=current_ref,
                         message=(
-                            f"No account with known usage has more remaining quota; "
-                            f"some usage is unavailable — staying on Account-{current_num}."
+                            f"{incomplete} - staying on Account-{current_num}."
                         ),
                     )
                 print(dimmed(
-                    f"No account with known usage has more remaining quota; some "
-                    f"usage is unavailable — staying on Account-{current_num}."
+                    f"{incomplete} - staying on Account-{current_num}."
                 ))
                 return None
             if note == "stay":
@@ -2319,12 +2420,12 @@ class ClaudeAccountSwitcher:
                         strategy=strategy_label, reason="already-best",
                         to_ref=current_ref,
                         message=(
-                            f"Already on the account with the most remaining quota "
+                            f"{already_best} "
                             f"(Account-{current_num})."
                         ),
                     )
                 print(
-                    f"{accent('Already on the account with the most remaining quota')} "
+                    f"{accent(already_best)} "
                     f"(Account-{current_num})."
                 )
                 return None
@@ -2334,12 +2435,12 @@ class ClaudeAccountSwitcher:
                         strategy=strategy_label, reason="candidates-exhausted",
                         to_ref=current_ref,
                         message=(
-                            f"All accounts are at their 5h/7d limit — staying on "
+                            f"{exhausted} - staying on "
                             f"Account-{current_num}."
                         ),
                     )
                 warning(
-                    f"All accounts are at their 5h/7d limit — staying on "
+                    f"{exhausted} - staying on "
                     f"Account-{current_num}."
                 )
                 return None

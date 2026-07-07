@@ -47,7 +47,7 @@ from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.locking import FileLock
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import ClaudeAccountSwitcher, FABLE_MODEL_NAME
 from claude_swap.usage_store import due_candidate
 
 STATE_FILENAME = "autoswitch_state.json"
@@ -323,9 +323,24 @@ def _refresh_fingerprint(credentials: str) -> str | None:
     return "sha256:" + hashlib.sha256(token.encode()).hexdigest()
 
 
-def binding_pct(usage: dict | None) -> float | None:
-    """Utilization of the binding (higher) 5h/7d window, or None."""
-    headroom = oauth.account_headroom(usage)
+def strategy_headroom(usage: dict | None, strategy: str = "best") -> float | None:
+    """Decision headroom for the active auto-switch strategy."""
+    rate_headroom = oauth.account_headroom(usage)
+    if strategy != "fable-best":
+        return rate_headroom
+    fable_headroom = oauth.scoped_model_headroom(usage, FABLE_MODEL_NAME)
+    headrooms = [
+        h for h in (rate_headroom, fable_headroom)
+        if h is not None
+    ]
+    if not headrooms:
+        return None
+    return min(headrooms)
+
+
+def binding_pct(usage: dict | None, strategy: str = "best") -> float | None:
+    """Utilization of the binding decision window, or None."""
+    headroom = strategy_headroom(usage, strategy)
     return None if headroom is None else 100.0 - headroom
 
 
@@ -626,7 +641,11 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
-        active_headroom = headroom.get(current)
+        active_value = usage.get(current)
+        active_headroom = strategy_headroom(
+            active_value if isinstance(active_value, dict) else None,
+            settings.strategy,
+        )
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
@@ -641,7 +660,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
-            if usage.get(current) == USAGE_TOKEN_EXPIRED:
+            if active_value == USAGE_TOKEN_EXPIRED:
                 # Expired while an owner (Claude Code / live session) holds the
                 # credential: CC refreshes on every API request, so expired +
                 # owner present proves Claude has been idle since expiry — no
@@ -714,13 +733,27 @@ class AutoSwitchEngine:
             return TickOutcome.BLOCKED
 
         hysteresis_bar = settings.threshold - settings.hysteresis_pct
-        qualifying: list[tuple[float, str]] = []
+        qualifying: list[tuple[tuple[float, ...], str]] = []
         any_known = False
+        any_strategy_known = False
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
                 continue
             any_known = True
+            score: tuple[float, ...] = (h,)
+            if settings.strategy == "fable-best":
+                value = usage.get(num)
+                fable_h = oauth.scoped_model_headroom(
+                    value if isinstance(value, dict) else None,
+                    FABLE_MODEL_NAME,
+                )
+                if fable_h is None:
+                    continue
+                any_strategy_known = True
+                score = (fable_h, h)
+            else:
+                any_strategy_known = True
             if h <= 0:
                 continue  # itself at its limit — never a target
             if trigger == "proactive":
@@ -733,20 +766,25 @@ class AutoSwitchEngine:
                     continue
                 if active_headroom is not None and h <= active_headroom:
                     continue  # not provably better than where we are
-            qualifying.append((h, num))
-        # Best headroom first; list order (sequence order) breaks ties.
-        qualifying.sort(key=lambda t: -t[0])
+            qualifying.append((score, num))
+        # Best strategy score first; list order (sequence order) breaks ties.
+        qualifying.sort(key=lambda t: tuple(-part for part in t[0]))
         ordered = [num for _, num in qualifying]
         if not ordered and api_key_candidates:
             # Last resort: metered API-key accounts (unmeasurable headroom).
             ordered = api_key_candidates
 
         if not ordered:
-            if not any_known:
+            if not any_known or not any_strategy_known:
+                detail = (
+                    "no candidate has readable Fable usage"
+                    if settings.strategy == "fable-best"
+                    else "no candidate has readable usage"
+                )
                 self._emit(
                     NoSwitchEvent(
                         reason="no-comparison",
-                        detail="no candidate has readable usage",
+                        detail=detail,
                     )
                 )
                 return TickOutcome.BLOCKED
@@ -869,8 +907,9 @@ class AutoSwitchEngine:
         usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         active_value = usage.get(current)
-        active_headroom = oauth.account_headroom(
-            active_value if isinstance(active_value, dict) else None
+        active_headroom = strategy_headroom(
+            active_value if isinstance(active_value, dict) else None,
+            self.settings.strategy,
         )
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
@@ -906,7 +945,7 @@ class AutoSwitchEngine:
         escalation are enforced elsewhere and unaffected.
         """
         interval = float(self.settings.interval_seconds)
-        pct = binding_pct(entry.last_good)
+        pct = binding_pct(entry.last_good, self.settings.strategy)
         if pct is None:
             return interval
         distance = (self.settings.threshold - ESCALATION_MARGIN_PCT) - pct
@@ -942,8 +981,8 @@ class AutoSwitchEngine:
             if after.fetched_at is None or after.fetched_at == before.fetched_at:
                 continue  # not fetched this pass
             base = before.poll_interval_s or self.settings.interval_seconds
-            prev_pct = binding_pct(before.last_good)
-            new_pct = binding_pct(after.last_good)
+            prev_pct = binding_pct(before.last_good, self.settings.strategy)
+            new_pct = binding_pct(after.last_good, self.settings.strategy)
             if prev_pct is None or new_pct is None:
                 interval = self.settings.interval_seconds
             elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:

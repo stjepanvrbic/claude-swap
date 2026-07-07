@@ -40,11 +40,18 @@ class FakeClock:
         self.now += seconds
 
 
-def _usage(pct: float, resets_at: str | None = None) -> dict:
+def _usage(
+    pct: float,
+    resets_at: str | None = None,
+    fable_pct: float | None = None,
+) -> dict:
     window: dict = {"pct": pct}
     if resets_at:
         window["resets_at"] = resets_at
-    return {"five_hour": window, "seven_day": {"pct": 0.0}}
+    usage = {"five_hour": window, "seven_day": {"pct": 0.0}}
+    if fable_pct is not None:
+        usage["scoped"] = [{"name": "Fable", "pct": fable_pct}]
+    return usage
 
 
 def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
@@ -177,6 +184,58 @@ class TestDecisionTable:
         assert switch.trigger == "proactive"
         assert switch.to_ref == {"number": 3, "email": "c@example.com"}
         assert harness.state()["lastSwitchTo"] == "3"
+
+    def test_fable_best_orders_viable_candidates_by_fable(self, temp_home):
+        h = EngineHarness(temp_home, strategy="fable-best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(95, fable_pct=80),
+            "2": _usage(10, fable_pct=70),  # Best 5h/7d headroom.
+            "3": _usage(20, fable_pct=10),  # Best Fable headroom.
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_fable_best_switches_when_active_fable_crosses_threshold(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, strategy="fable-best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(20, fable_pct=95),
+            "2": _usage(10, fable_pct=70),
+            "3": _usage(20, fable_pct=10),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+
+    def test_fable_best_below_fable_and_rate_threshold_is_no_action(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home, strategy="fable-best")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(20, fable_pct=80),
+            "2": _usage(10, fable_pct=10),
+        })
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
 
     def test_no_active_account(self, temp_home):
         h = EngineHarness(temp_home)

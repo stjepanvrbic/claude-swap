@@ -357,6 +357,31 @@ def account_headroom(usage: dict | None) -> float | None:
     return 100.0 - max(pcts)
 
 
+def scoped_model_headroom(usage: dict | None, model_name: str) -> float | None:
+    """Remaining percentage for a per-model scoped weekly limit.
+
+    The usage API surfaces model-specific limits as ``usage["scoped"]`` rows.
+    Match the model display name case-insensitively and return the binding
+    headroom if duplicate rows ever appear. ``None`` means the model window is
+    absent or unreadable, not unlimited.
+    """
+    if not isinstance(usage, dict):
+        return None
+    target = model_name.casefold()
+    pcts = [
+        window["pct"]
+        for window in usage.get("scoped") or []
+        if (
+            isinstance(window, dict)
+            and str(window.get("name", "")).casefold() == target
+            and isinstance(window.get("pct"), (int, float))
+        )
+    ]
+    if not pcts:
+        return None
+    return 100.0 - max(pcts)
+
+
 @dataclass(frozen=True)
 class UsageOutcome:
     """Result of a usage-API fetch attempt.

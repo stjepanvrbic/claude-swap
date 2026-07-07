@@ -187,6 +187,18 @@ class TestCLI:
             strategy="best", json_output=False
         )
 
+    def test_switch_fable_strategy_forwarded(self):
+        """--switch --strategy fable-best forwards the strategy to switch()."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch", "--strategy", "fable-best"]), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(
+            strategy="fable-best", json_output=False
+        )
+
     def test_plain_switch_passes_no_strategy(self):
         """Bare --switch forwards strategy=None."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
@@ -626,6 +638,9 @@ class TestSubcommandAliases:
         assert cli._translate_subcommand(["switch", "--strategy", "best"]) == [
             "--switch", "--strategy", "best",
         ]
+        assert cli._translate_subcommand(["switch", "--strategy", "fable-best"]) == [
+            "--switch", "--strategy", "fable-best",
+        ]
 
     def test_translate_switch_with_target(self):
         assert cli._translate_subcommand(["switch", "2"]) == ["--switch-to", "2"]
@@ -861,6 +876,19 @@ class TestAutoCommand:
         engine = self.FakeEngine.instances[-1]
         assert engine.settings.threshold == 60.0     # CLI wins
         assert engine.settings.cooldown_seconds == 42.0  # settings.json kept
+
+    def test_strategy_flag_overrides_settings_json(self, temp_home):
+        from claude_swap.paths import get_backup_root
+
+        backup = get_backup_root()
+        backup.mkdir(parents=True, exist_ok=True)
+        (backup / "settings.json").write_text(json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"strategy": "best"},
+        }))
+        self._run(["--once", "--strategy", "fable-best"], temp_home)
+
+        assert self.FakeEngine.instances[-1].settings.strategy == "fable-best"
 
     def test_dry_run_forwarded(self, temp_home):
         self._run(["--once", "--dry-run"], temp_home)

@@ -11,6 +11,7 @@ from claude_swap import __version__
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import dimmed, error, muted
+from claude_swap.settings import AUTOSWITCH_STRATEGIES, SWITCH_STRATEGIES
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -239,8 +240,9 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding 5h/7d window reaches "
-            "this utilization (50-99.9; default 90)"
+            "Switch when the active account's binding usage reaches this "
+            "utilization (5h/7d, plus Fable when strategy=fable-best; "
+            "50-99.9; default 90)"
         ),
     )
     parser.add_argument(
@@ -248,6 +250,15 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="SECONDS",
         help="Minimum time between proactive switches (default 300)",
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=AUTOSWITCH_STRATEGIES,
+        metavar="{best,fable-best}",
+        help=(
+            "Target selection strategy. 'best' maximizes 5h/7d headroom; "
+            "'fable-best' prefers Fable weekly headroom among viable accounts."
+        ),
     )
     parser.add_argument(
         "--include-api-key-accounts",
@@ -558,6 +569,7 @@ Aliases: ls=list  rm=remove  update=upgrade""",
         epilog="""Flags combine with subcommands:
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
+  %(prog)s switch --strategy fable-best     # prefer Fable headroom
   %(prog)s switch user@example.com
   %(prog)s list --json
   %(prog)s add --slot 3                      # add to a specific slot
@@ -596,12 +608,13 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     )
     parser.add_argument(
         "--strategy",
-        choices=["best", "next-available"],
-        metavar="{best,next-available}",
+        choices=SWITCH_STRATEGIES,
+        metavar="{best,next-available,fable-best}",
         help=(
             "With bare 'switch': pick the target by remaining 5h/7d quota. "
             "'best' jumps to the account with the most headroom; "
-            "'next-available' rotates to the next account, skipping any at their limit"
+            "'next-available' rotates to the next account, skipping any at their limit; "
+            "'fable-best' prefers Fable weekly headroom among viable accounts"
         ),
     )
     parser.add_argument(
