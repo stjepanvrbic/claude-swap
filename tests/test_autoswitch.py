@@ -684,6 +684,18 @@ class TestAdaptiveScheduler:
             assert counts == expected, "one candidate per tick, stalest first"
             h.clock.advance(60)
 
+    def test_rebalance_does_not_force_full_refresh(self, temp_home, monkeypatch):
+        h = self._harness(temp_home, monkeypatch, rebalance=True)
+        counts: dict[str, int] = {}
+
+        outcome = self._tick(
+            h, counts, {"1": _usage(55), "2": _usage(10), "3": _usage(20)}
+        )
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert counts == {"1": 1, "2": 1}
+
     def test_near_threshold_escalates_to_full_refresh(self, temp_home, monkeypatch):
         # threshold 95, margin 15 -> active at 80% is within the escalation band.
         h = self._harness(temp_home, monkeypatch)

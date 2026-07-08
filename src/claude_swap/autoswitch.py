@@ -1032,7 +1032,6 @@ class AutoSwitchEngine:
             self.settings.strategy,
         )
         escalate = bool(candidates) and (
-            self.settings.rebalance or
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
