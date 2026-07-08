@@ -152,6 +152,13 @@ def format_age(age_s: float | None) -> str | None:
     return f"· {format_duration(age_s)} ago"
 
 
+def refresh_issue(entry: usage_store.UsageEntry) -> str | None:
+    """Short note for stale-on-error display rows."""
+    if not entry.last_error:
+        return None
+    return f"refresh failed: {entry.last_error}"
+
+
 def clock_stamp() -> str:
     """HH:MM:SS local-time stamp for the event log."""
     return time.strftime("%H:%M:%S")
@@ -163,6 +170,7 @@ __all__ = [
     "format_age",
     "format_duration",
     "last_seen_note",
+    "refresh_issue",
     "reset_text",
     "run_action",
     "sentinel_label",

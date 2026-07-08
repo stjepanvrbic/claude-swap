@@ -183,13 +183,17 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
         return out
     if entry.last_good is not None:
         lines = _format_usage_lines(entry.last_good)
+        notes: list[str] = []
         if (
-            lines
-            and entry.age_s is not None
+            entry.age_s is not None
             and entry.age_s > _USAGE_AGE_NOTE_S
             and entry.fetched_at is not None
         ):
-            lines[-1] += f" · {format_age(int(entry.fetched_at * 1000))}"
+            notes.append(format_age(int(entry.fetched_at * 1000)))
+        if entry.last_error:
+            notes.append(f"refresh failed: {entry.last_error}")
+        if lines and notes:
+            lines[-1] += " · " + " · ".join(notes)
         return [
             f"{dimmed('└' if j == len(lines) - 1 else '├')} {muted(line)}"
             for j, line in enumerate(lines)

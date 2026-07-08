@@ -143,6 +143,9 @@ def account_card_text(
     age = data.format_age(acc.usage.age_s)
     if age:
         text.append(f"   {age}", style=MUTED)
+    issue = data.refresh_issue(acc.usage)
+    if issue:
+        text.append(f"   {issue}", style=SEV_WARN)
 
     sentinel = acc.usage.sentinel
     if sentinel is not None:
@@ -168,7 +171,11 @@ def account_card_text(
             text.append(f" · {acc.usage.last_error}", style=MUTED)
         return text
 
-    stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
+    stale = (
+        acc.usage.age_s is not None
+        and acc.usage.age_s > STALE_OK_S
+        and not acc.usage.trust_extended
+    )
     label_width = max(len(label) for label, _pct, _suffix in rows)
     bar_width = max(12, min(30, width - 42 - label_width))
     for label, pct, suffix in rows:
@@ -207,7 +214,11 @@ def mini_account_text(acc: AccountSnapshot, now: float) -> Text:
         return text
 
     last_good = acc.usage.last_good
-    stale = acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S
+    stale = (
+        acc.usage.age_s is not None
+        and acc.usage.age_s > STALE_OK_S
+        and not acc.usage.trust_extended
+    )
     parts = 0
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = last_good.get(key) if isinstance(last_good, dict) else None
@@ -236,6 +247,12 @@ def mini_account_text(acc: AccountSnapshot, now: float) -> Text:
         parts += 1
     if not parts:
         text.append("usage unknown", style=MUTED)
+        parts = 1
+    issue = data.refresh_issue(acc.usage)
+    if issue:
+        if parts:
+            text.append(" · ", style=TRACK)
+        text.append(issue, style=SEV_WARN)
     return text
 
 

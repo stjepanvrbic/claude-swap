@@ -44,6 +44,8 @@ def make_entry(
     *,
     sentinel: str | None = None,
     age_s: float = 5.0,
+    last_error: str | None = None,
+    trust_extended: bool = False,
     scoped: list[tuple[str, float]] | None = None,
     spend: dict | None = None,
 ) -> UsageEntry:
@@ -66,6 +68,8 @@ def make_entry(
         last_good=last_good,
         fetched_at=time.time() - age_s,
         age_s=age_s,
+        last_error=last_error,
+        trust_extended=trust_extended,
     )
 
 
@@ -264,6 +268,24 @@ class TestFormatting:
         text = tui_data.window_reset_text(entry.last_good, "five_hour", time.time())
         assert text is not None and text.startswith("resets ")
         assert tui_data.window_reset_text(None, "five_hour", time.time()) is None
+
+    def test_trusted_stale_card_shows_refresh_error_without_dimming(self):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        entry = make_entry(
+            60,
+            30,
+            age_s=600,
+            last_error="http-429",
+            trust_extended=True,
+        )
+
+        card = account_card_text(make_account(1, active=True, entry=entry), 80)
+        mini = mini_account_text(make_account(1, entry=entry), time.time())
+
+        assert "refresh failed: http-429" in card.plain
+        assert "refresh failed: http-429" in mini.plain
+        assert "dim" not in " ".join(str(span.style) for span in card.spans)
 
 
 class TestSnapshotSource:

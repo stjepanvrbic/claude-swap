@@ -21,7 +21,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     ValidationError,
 )
-from claude_swap.usage_store import FetchRecord, UsageStore
+from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
 from claude_swap.macos_keychain import KeychainError
 from claude_swap.models import Platform
 from claude_swap.paths import get_backup_root, get_credentials_path
@@ -32,6 +32,7 @@ from claude_swap.switcher import (
     SECURITY_SERVICE,
     SETUP_TOKEN_SCOPES,
     _format_usage_lines,
+    _usage_entry_lines,
 )
 
 
@@ -4117,3 +4118,16 @@ class TestFormatUsageLines:
         usage = {"five_hour": {"pct": 7.0, "clock": "20:39", "countdown": "1h 30m"}}
         lines = _format_usage_lines(usage)
         assert lines == ["5h:   7%   resets 20:39         in 1h 30m"]
+
+    def test_stale_last_good_shows_refresh_error(self):
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 60.0}},
+            fetched_at=time.time() - 600,
+            age_s=600.0,
+            last_error="http-429",
+        )
+
+        lines = _usage_entry_lines(entry)
+
+        assert "10m ago" in lines[-1]
+        assert "refresh failed: http-429" in lines[-1]
