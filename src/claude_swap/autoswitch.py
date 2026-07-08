@@ -86,18 +86,11 @@ ESCALATION_MARGIN_PCT = 15.0
 # an unmoved one backs off, up to the cap.
 MOVEMENT_DELTA_PCT = 1.0
 CANDIDATE_MAX_INTERVAL_S = 600.0
-# The active account's cadence relaxes with distance (in utilization points)
-# to the escalation band, because burn rate is absolute: >50 pts below the
-# band → this hard cap (never slower); >25 pts → 2× the interval; else every
-# tick. Distance-based rather than absolute pct so an adjusted threshold
-# keeps the same safety margin (at threshold 50 the cap is simply never
-# reachable). The cap stays under STALE_OK_S so a relaxed active never loses
-# decision trust, and the worst plausible burn (~5%/min, heavy subagent use)
-# moves +15 pts between capped polls — still ≥35 pts from the band, and band
-# entry is seen at most one poll late, absorbed by ESCALATION_MARGIN_PCT +
-# hysteresis.
-ACTIVE_MAX_INTERVAL_S = 180.0
-ACTIVE_RELAX_DISTANCE_PCT = 25.0  # 2× interval beyond this; cap beyond 2× this
+# The active account is the one most likely to have live Claude traffic, so its
+# usage endpoint is also the most likely to return sustained 429s. Keep the
+# engine wake interval tight, but fetch active usage slowly until the last-known
+# reading enters the escalation band; then resume every-tick polling.
+ACTIVE_MAX_INTERVAL_S = 300.0
 
 
 def _now_iso() -> str:
@@ -1054,28 +1047,20 @@ class AutoSwitchEngine:
         return entries, usage, headroom
 
     def _active_poll_interval_s(self, entry) -> float:
-        """Stepwise active cadence by distance to the escalation band.
+        """Fetch active usage slowly until the escalation band.
 
-        Unknown utilization or in-band → every tick (the at-limit escape and
-        failover paths must never wait); more than ``ACTIVE_RELAX_DISTANCE_PCT``
-        points below the band → 2× the engine interval; more than twice that
-        → ``ACTIVE_MAX_INTERVAL_S``. (At the default threshold 90 these are
-        the <50% / <25% utilization steps.) Derived per tick from the stored
-        entry — no persisted state, and failure backoff / idle-hold /
-        escalation are enforced elsewhere and unaffected.
+        Unknown utilization or in-band usage polls every tick. Known usage
+        below the escalation band waits longer because live Claude traffic is
+        the common source of sustained usage-endpoint 429s.
         """
         interval = float(self.settings.interval_seconds)
         pct = binding_pct(entry.last_good, self.settings.strategy)
         if pct is None:
             return interval
-        distance = (self.settings.threshold - ESCALATION_MARGIN_PCT) - pct
-        if distance > 2 * ACTIVE_RELAX_DISTANCE_PCT:
-            tier = ACTIVE_MAX_INTERVAL_S
-        elif distance > ACTIVE_RELAX_DISTANCE_PCT:
-            tier = 2.0 * interval
-        else:
+        band_edge = self.settings.threshold - ESCALATION_MARGIN_PCT
+        if pct >= band_edge:
             return interval
-        return min(tier, ACTIVE_MAX_INTERVAL_S)
+        return ACTIVE_MAX_INTERVAL_S
 
     def _update_poll_plans(
         self, candidates: list[str], pre: dict, post: dict, now: float

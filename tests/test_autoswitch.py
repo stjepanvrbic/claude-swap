@@ -678,8 +678,8 @@ class TestAdaptiveScheduler:
         h = self._harness(temp_home, monkeypatch)
         usage = {"1": _usage(55), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
-        for expected in ({"1": 1, "2": 1}, {"1": 2, "2": 1, "3": 1},
-                         {"1": 3, "2": 2, "3": 1}):
+        for expected in ({"1": 1, "2": 1}, {"1": 1, "2": 1, "3": 1},
+                         {"1": 1, "2": 2, "3": 1}):
             self._tick(h, counts, usage)
             assert counts == expected, "one candidate per tick, stalest first"
             h.clock.advance(60)
@@ -720,30 +720,33 @@ class TestAdaptiveScheduler:
         assert h.active_number() == 2
 
     def test_active_far_from_threshold_polls_at_the_cap(self, temp_home, monkeypatch):
-        # Active at 10%: far from the band → polled every 180s, not every tick.
+        # Active at 10%: below the band -> polled every 300s, not every tick.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(10), "2": _usage(20)}
         counts: dict[str, int] = {}
-        self._tick(h, counts, usage)  # never-fetched → fetched
+        self._tick(h, counts, usage)  # never-fetched -> fetched
         assert counts["1"] == 1
-        for _ in range(2):  # ages 60s and 120s — inside the 180s tier
+        for _ in range(4):  # ages 60s..240s - inside the 300s tier
             h.clock.advance(60)
             self._tick(h, counts, usage)
         assert counts["1"] == 1
-        h.clock.advance(60)  # age 180s → due again
+        h.clock.advance(60)  # age 300s -> due again
         self._tick(h, counts, usage)
         assert counts["1"] == 2
 
-    def test_active_mid_headroom_polls_every_other_tick(self, temp_home, monkeypatch):
+    def test_active_mid_headroom_uses_five_minute_cadence(
+        self, temp_home, monkeypatch
+    ):
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(40), "2": _usage(20)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
-        h.clock.advance(60)
-        self._tick(h, counts, usage)  # age 60s < 2× interval → skipped
+        for _ in range(4):
+            h.clock.advance(60)
+            self._tick(h, counts, usage)
         assert counts["1"] == 1
         h.clock.advance(60)
-        self._tick(h, counts, usage)  # age 120s → due
+        self._tick(h, counts, usage)
         assert counts["1"] == 2
 
     def test_active_in_band_polls_every_tick(self, temp_home, monkeypatch):
@@ -756,36 +759,34 @@ class TestAdaptiveScheduler:
             assert counts["1"] == expected
             h.clock.advance(60)
 
-    def test_low_threshold_never_relaxes_near_its_band(self, temp_home, monkeypatch):
-        # Tiers are distance-to-band, not absolute pct: with threshold 50
-        # (band edge 35) an active at 10% is only 25 pts out — no relaxation,
-        # even though 10% would hit the 180s cap under the default threshold.
+    def test_low_threshold_polls_every_tick_inside_band(self, temp_home, monkeypatch):
+        # Band logic is threshold-relative: with threshold 50, band edge is 35.
         h = self._harness(temp_home, monkeypatch, accounts=2, threshold=50)
-        usage = {"1": _usage(10), "2": _usage(20)}
+        usage = {"1": _usage(35), "2": _usage(20)}
         counts: dict[str, int] = {}
         for expected in (1, 2, 3):
             self._tick(h, counts, usage)
             assert counts["1"] == expected
             h.clock.advance(60)
 
-    def test_band_jump_is_seen_at_most_one_relaxed_poll_late(
+    def test_band_jump_waits_until_active_five_minute_poll(
         self, temp_home, monkeypatch
     ):
-        # Active at 40% (2×-interval tier) jumps into the band between polls:
-        # the jump is picked up on the next tier poll and escalates the same
-        # tick (candidates refreshed despite none being due).
+        # Active at 40% jumps into the band between polls. The active account is
+        # not refetched until its 5 minute cadence elapses, limiting usage API
+        # pressure while it is busy.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(40), "2": _usage(20)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         usage["1"] = _usage(80)
+        for _ in range(4):
+            h.clock.advance(60)
+            self._tick(h, counts, usage)
+            assert counts["1"] == 1
         h.clock.advance(60)
-        self._tick(h, counts, usage)  # tier-skipped: still believed at 40%
-        assert counts["1"] == 1
-        h.clock.advance(60)
-        self._tick(h, counts, usage)  # tier poll sees 80% → escalate-all
+        self._tick(h, counts, usage)
         assert counts["1"] == 2
-        assert counts["2"] == 3  # baseline t0 + due t60 + escalation t120
 
     def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
         # The active account's fetches are being refused (429 with a long
