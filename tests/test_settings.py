@@ -62,6 +62,7 @@ class TestLoadSettings:
                 "threshold": 200,
                 "intervalSeconds": 1,
                 "hysteresisPct": -5,
+                "rebalanceMinImprovementPct": 200,
                 "unhealthyTicks": 0,
             }
         }))
@@ -69,6 +70,7 @@ class TestLoadSettings:
         assert loaded.threshold == 99.9
         assert loaded.interval_seconds == 15.0  # usage-cache TTL floor
         assert loaded.hysteresis_pct == 0.0
+        assert loaded.rebalance_min_improvement_pct == 50.0
         assert loaded.unhealthy_ticks == 1
 
     def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
@@ -154,6 +156,8 @@ class TestSetUnsetSetting:
 
     def test_set_rejects_bool_words_strictly(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "FALSE") is False
+        assert set_setting(tmp_path, "autoswitch.enabled", "yes") is True
+        assert set_setting(tmp_path, "autoswitch.rebalance", "true") is True
         with pytest.raises(ConfigError, match="true or false"):
             set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "falsy")
 

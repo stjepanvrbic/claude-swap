@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from claude_swap.background import BackgroundStatus
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -40,16 +41,19 @@ class TestConfigList:
         code, out, _ = _run([], capsys)
         assert code == 0
         for key in (
+            "autoswitch.enabled",
             "autoswitch.threshold",
             "autoswitch.intervalSeconds",
             "autoswitch.cooldownSeconds",
             "autoswitch.hysteresisPct",
             "autoswitch.strategy",
+            "autoswitch.rebalance",
+            "autoswitch.rebalanceMinImprovementPct",
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
         ):
             assert key in out
-        assert out.count("(default)") == 7
+        assert out.count("(default)") == 10
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -76,9 +80,11 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 7
+        assert len(by_key) == 10
+        assert by_key["autoswitch.enabled"]["value"] is False
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
+        assert by_key["autoswitch.rebalance"]["value"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
 
 
@@ -107,6 +113,37 @@ class TestConfigSetGet:
         assert "= false" in out
         raw = json.loads(_settings_file(capsys).read_text())
         assert raw["autoswitch"]["includeApiKeyAccounts"] is False
+
+    def test_set_enabled_starts_and_stops_background(self, temp_home, capsys):
+        running = BackgroundStatus(
+            enabled=True,
+            pid=123,
+            running=True,
+            pid_path=Path("pid"),
+            log_path=Path("log"),
+        )
+        stopped = BackgroundStatus(
+            enabled=False,
+            pid=None,
+            running=False,
+            pid_path=Path("pid"),
+            log_path=Path("log"),
+        )
+
+        with patch("claude_swap.background.start", return_value=running) as start:
+            code, out, err = _run(["set", "autoswitch.enabled", "true"], capsys)
+        assert code == 0
+        assert err == ""
+        assert "autoswitch.enabled = true" in out
+        assert "auto-switch background: running" in out
+        start.assert_called_once()
+
+        with patch("claude_swap.background.stop", return_value=stopped) as stop:
+            code, out, err = _run(["set", "autoswitch.enabled", "false"], capsys)
+        assert code == 0
+        assert err == ""
+        assert "auto-switch background: stopped" in out
+        stop.assert_called_once()
 
     def test_set_preserves_unknown_keys(self, temp_home, capsys):
         path = _settings_file(capsys)
@@ -224,6 +261,27 @@ class TestConfigUnset:
         code, out, _ = _run(["get", "autoswitch.threshold"], capsys)
         assert out.strip() == "90"
         # The emptied autoswitch section is removed entirely.
+        raw = json.loads(_settings_file(capsys).read_text())
+        assert "autoswitch" not in raw
+
+    def test_unset_enabled_stops_without_persisting_false(self, temp_home, capsys):
+        stopped = BackgroundStatus(
+            enabled=False,
+            pid=None,
+            running=False,
+            pid_path=Path("pid"),
+            log_path=Path("log"),
+        )
+        with patch("claude_swap.background.start", return_value=stopped):
+            _run(["set", "autoswitch.enabled", "true"], capsys)
+
+        with patch("claude_swap.background.stop", return_value=stopped) as stop:
+            code, out, _ = _run(["unset", "autoswitch.enabled"], capsys)
+
+        assert code == 0
+        assert "default: false" in out
+        stop.assert_called_once()
+        assert stop.call_args.kwargs == {"persist": False}
         raw = json.loads(_settings_file(capsys).read_text())
         assert "autoswitch" not in raw
 

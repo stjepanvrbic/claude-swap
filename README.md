@@ -87,6 +87,9 @@ cswap auto --threshold 80      # switch earlier
 cswap auto --strategy fable-best # choose targets by Fable weekly headroom
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
+cswap auto start               # detach a background worker
+cswap auto status              # show whether the worker is running
+cswap auto stop                # stop the background worker
 ```
 
 <details>
@@ -95,6 +98,8 @@ cswap auto --dry-run           # log what it would do, never switch
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold; when every account is exhausted it sleeps until the earliest reset.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, exhausted ones left alone until they reset — so API traffic stays flat no matter how many accounts you manage.
+- `cswap auto start` sets `autoswitch.enabled=true`, launches a detached worker, and writes `autoswitch_background.log` beside your settings. `cswap auto stop` flips it back to false and stops the worker. `cswap config set autoswitch.enabled true|false` does the same thing. Installing the tool never starts it by itself.
+- Set `autoswitch.rebalance=true` if you want the worker to switch early to a meaningfully better account instead of waiting for the threshold. The target still has to clear the hysteresis bar, and it must improve the active account by `autoswitch.rebalanceMinImprovementPct` points, so accounts even out without constant bouncing.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you log in with it and re-run `cswap add --slot N`. API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 
@@ -104,7 +109,7 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
-Defaults like the threshold, cooldown, and strategy are configurable with `cswap config set autoswitch.threshold 80` and `cswap config set autoswitch.strategy fable-best` — flags override them (see [Configuration](#configuration)).
+Defaults like the threshold, cooldown, strategy, background enabled flag, and rebalance policy are configurable with `cswap config set autoswitch.threshold 80`, `cswap config set autoswitch.strategy fable-best`, and `cswap config set autoswitch.rebalance true` — flags override them (see [Configuration](#configuration)).
 
 </details>
 
@@ -143,6 +148,9 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 cswap run 2                     # Run an account in this terminal only (session mode)
 cswap auto                      # Auto-switch when nearing rate limits (see above)
+cswap auto start                # Start the background auto-switch worker
+cswap auto status               # Show background auto-switch state
+cswap auto stop                 # Stop the background auto-switch worker
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap status                    # Show current account
@@ -177,7 +185,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`), auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset), and background worker files (`autoswitch_background.pid` / `autoswitch_background.log`) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -209,8 +217,11 @@ Tool preferences live in `settings.json` in the backup root; `cswap config` read
 ```bash
 cswap config                              # list effective settings ("(default)" = not set)
 cswap config get autoswitch.threshold
+cswap config set autoswitch.enabled true  # same as: cswap auto start
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.strategy fable-best
+cswap config set autoswitch.rebalance true
+cswap config set autoswitch.rebalanceMinImprovementPct 10
 cswap config unset autoswitch.threshold   # back to the default
 cswap config path                         # where settings.json lives
 ```

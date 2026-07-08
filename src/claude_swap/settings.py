@@ -42,11 +42,14 @@ class AutoSwitchSettings:
     the threshold, so two accounts hovering at the line never ping-pong.
     """
 
+    enabled: bool = False
     threshold: float = 90.0
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
     strategy: str = "best"
+    rebalance: bool = False
+    rebalance_min_improvement_pct: float = 10.0
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
 
@@ -84,6 +87,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
     spec.dotted: spec
     for spec in (
         SettingSpec(
+            "autoswitch", "enabled", "enabled", "bool",
+            help="Keep the detached background auto-switch worker running",
+        ),
+        SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
             help="Switch when the binding 5h/7d window reaches this pct",
         ),
@@ -103,6 +110,15 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "strategy", "strategy", "choice",
             choices=AUTOSWITCH_STRATEGIES,
             help="How auto-switch picks the target account",
+        ),
+        SettingSpec(
+            "autoswitch", "rebalance", "rebalance", "bool",
+            help="Allow background/auto to switch to a much better account early",
+        ),
+        SettingSpec(
+            "autoswitch", "rebalanceMinImprovementPct",
+            "rebalance_min_improvement_pct", "float", 0.0, 50.0,
+            help="Extra headroom required before an early rebalance switch",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",

@@ -188,7 +188,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover"
+    trigger: str  # "proactive" | "rebalance" | "at-limit" | "failover"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -336,6 +336,19 @@ def strategy_headroom(usage: dict | None, strategy: str = "best") -> float | Non
     if not headrooms:
         return None
     return min(headrooms)
+
+
+def strategy_score(usage: dict | None, strategy: str = "best") -> tuple[float, ...] | None:
+    """Comparable score for choosing a target under an auto-switch strategy."""
+    rate_headroom = oauth.account_headroom(usage)
+    if rate_headroom is None:
+        return None
+    if strategy != "fable-best":
+        return (rate_headroom,)
+    fable_headroom = oauth.scoped_model_headroom(usage, FABLE_MODEL_NAME)
+    if fable_headroom is None:
+        return None
+    return (fable_headroom, rate_headroom)
 
 
 def binding_pct(usage: dict | None, strategy: str = "best") -> float | None:
@@ -651,14 +664,17 @@ class AutoSwitchEngine:
             self._idle_hold_since = None
             utilization = 100.0 - active_headroom
             if utilization < settings.threshold:
-                self._emit(
-                    NoSwitchEvent(
-                        reason="below-threshold",
-                        detail=f"{utilization:.0f}% < {settings.threshold:.0f}%",
+                if not settings.rebalance:
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="below-threshold",
+                            detail=f"{utilization:.0f}% < {settings.threshold:.0f}%",
+                        )
                     )
-                )
-                return TickOutcome.NO_ACTION
-            trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                    return TickOutcome.NO_ACTION
+                trigger = "rebalance"
+            else:
+                trigger = "at-limit" if active_headroom <= 0 else "proactive"
         else:
             if active_value == USAGE_TOKEN_EXPIRED:
                 # Expired while an owner (Claude Code / live session) holds the
@@ -707,7 +723,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger == "proactive" and self._in_cooldown(state):
+        if trigger in ("proactive", "rebalance") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -736,45 +752,59 @@ class AutoSwitchEngine:
         qualifying: list[tuple[tuple[float, ...], str]] = []
         any_known = False
         any_strategy_known = False
+        active_score = strategy_score(
+            active_value if isinstance(active_value, dict) else None,
+            settings.strategy,
+        )
         for num in oauth_candidates:
             h = headroom.get(num)
             if h is None:
                 continue
             any_known = True
-            score: tuple[float, ...] = (h,)
-            if settings.strategy == "fable-best":
-                value = usage.get(num)
-                fable_h = oauth.scoped_model_headroom(
-                    value if isinstance(value, dict) else None,
-                    FABLE_MODEL_NAME,
-                )
-                if fable_h is None:
-                    continue
-                any_strategy_known = True
-                score = (fable_h, h)
-            else:
-                any_strategy_known = True
+            value = usage.get(num)
+            score = strategy_score(
+                value if isinstance(value, dict) else None,
+                settings.strategy,
+            )
+            if score is None:
+                continue
+            any_strategy_known = True
             if h <= 0:
                 continue  # itself at its limit — never a target
-            if trigger == "proactive":
-                # Hysteresis guards only the proactive case: two accounts
-                # hovering at the line must not ping-pong. At-limit and
-                # failover are escapes — any account with real headroom
-                # beats a blocked or dead one (and you can't flap back onto
-                # an account at 100%).
+            if trigger in ("proactive", "rebalance"):
+                # Hysteresis guards optional moves: two accounts hovering at
+                # the line must not ping-pong. At-limit and failover are
+                # escapes - any account with real headroom beats a blocked or
+                # dead one (and you can't flap back onto an account at 100%).
                 if (100.0 - h) > hysteresis_bar:
                     continue
+            if trigger == "proactive":
                 if active_headroom is not None and h <= active_headroom:
                     continue  # not provably better than where we are
+            elif trigger == "rebalance":
+                if active_score is None:
+                    continue
+                if (
+                    score[0] - active_score[0]
+                    < settings.rebalance_min_improvement_pct
+                ):
+                    continue
             qualifying.append((score, num))
         # Best strategy score first; list order (sequence order) breaks ties.
         qualifying.sort(key=lambda t: tuple(-part for part in t[0]))
         ordered = [num for _, num in qualifying]
-        if not ordered and api_key_candidates:
+        if not ordered and api_key_candidates and trigger != "rebalance":
             # Last resort: metered API-key accounts (unmeasurable headroom).
             ordered = api_key_candidates
 
         if not ordered:
+            if trigger == "rebalance":
+                detail = (
+                    f"no target improves by "
+                    f"{settings.rebalance_min_improvement_pct:.0f} pct"
+                )
+                self._emit(NoSwitchEvent(reason="below-threshold", detail=detail))
+                return TickOutcome.NO_ACTION
             if not any_known or not any_strategy_known:
                 detail = (
                     "no candidate has readable Fable usage"
@@ -912,6 +942,7 @@ class AutoSwitchEngine:
             self.settings.strategy,
         )
         escalate = bool(candidates) and (
+            self.settings.rebalance or
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
@@ -1110,10 +1141,43 @@ class AutoSwitchEngine:
         # ±10% jitter so multiple machines don't synchronize their API hits.
         return interval * (0.9 + 0.2 * random.random())
 
-    def run_loop(self) -> int:
+    def _wait_between_ticks(
+        self,
+        delay: float,
+        settings_loader: Callable[[], AutoSwitchSettings] | None,
+        should_continue: Callable[[AutoSwitchSettings], bool] | None,
+    ) -> None:
+        if settings_loader is None and should_continue is None:
+            self._stop.wait(delay)
+            return
+
+        deadline = self.clock() + delay
+        while not self._stop.is_set():
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                return
+            self._stop.wait(min(remaining, 5.0))
+            if self._stop.is_set():
+                return
+            if settings_loader is not None:
+                self.settings = settings_loader()
+            if should_continue is not None and not should_continue(self.settings):
+                self.stop()
+                return
+
+    def run_loop(
+        self,
+        *,
+        settings_loader: Callable[[], AutoSwitchSettings] | None = None,
+        should_continue: Callable[[AutoSwitchSettings], bool] | None = None,
+    ) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
         self._stop.clear()
         while not self._stop.is_set():
+            if settings_loader is not None:
+                self.settings = settings_loader()
+            if should_continue is not None and not should_continue(self.settings):
+                break
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards
@@ -1132,5 +1196,5 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-            self._stop.wait(delay)
+            self._wait_between_ticks(delay, settings_loader, should_continue)
         return 0

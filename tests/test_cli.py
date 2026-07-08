@@ -928,7 +928,50 @@ class TestAutoCommand:
         assert excinfo.value.code == 0
         out = capsys.readouterr().out
         assert "--once" in out
+        assert "auto start" in out
         assert "Exit codes" in out
+
+    def test_auto_start_uses_background_manager(self, temp_home, capsys):
+        from claude_swap.background import BackgroundStatus
+
+        status = BackgroundStatus(
+            enabled=True,
+            pid=123,
+            running=True,
+            pid_path=Path("pid"),
+            log_path=Path("log"),
+        )
+        with patch("claude_swap.background.start", return_value=status) as start, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "start"]):
+            cli.main()
+
+        start.assert_called_once()
+        out = capsys.readouterr().out
+        assert "enabled, running, pid 123" in out
+        assert "log" in out
+
+    def test_auto_status_json(self, temp_home, capsys):
+        from claude_swap.background import BackgroundStatus
+
+        status = BackgroundStatus(
+            enabled=False,
+            pid=None,
+            running=False,
+            pid_path=Path("pid"),
+            log_path=Path("log"),
+        )
+        with patch("claude_swap.background.status", return_value=status), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(
+                 sys, "argv", ["claude-swap", "auto", "status", "--json"]
+             ):
+            cli.main()
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["action"] == "status"
+        assert payload["background"]["enabled"] is False
+        assert payload["background"]["running"] is False
 
     def test_main_help_mentions_auto(self):
         result = subprocess.run(

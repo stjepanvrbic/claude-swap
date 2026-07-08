@@ -174,6 +174,67 @@ class TestDecisionTable:
         reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
 
+    def test_rebalance_switches_below_threshold_to_better_account(self, temp_home):
+        h = EngineHarness(temp_home, rebalance=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(40), "2": _usage(10), "3": _usage(35),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "rebalance"
+
+    def test_rebalance_requires_configured_improvement(self, temp_home):
+        h = EngineHarness(temp_home, rebalance=True, rebalance_min_improvement_pct=10)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({"1": _usage(40), "2": _usage(35)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "below-threshold"
+        assert "10 pct" in event.detail
+
+    def test_rebalance_respects_hysteresis_bar(self, temp_home):
+        h = EngineHarness(
+            temp_home,
+            rebalance=True,
+            rebalance_min_improvement_pct=0,
+        )
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({"1": _usage(85), "2": _usage(82)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_fable_rebalance_uses_fable_headroom_first(self, temp_home):
+        h = EngineHarness(temp_home, strategy="fable-best", rebalance=True)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(20, fable_pct=50),
+            "2": _usage(10, fable_pct=45),
+            "3": _usage(20, fable_pct=10),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     def test_over_threshold_switches_to_max_headroom(self, harness):
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(40), "3": _usage(20),

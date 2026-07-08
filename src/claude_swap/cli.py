@@ -194,6 +194,13 @@ def _auto_command(argv: list[str]) -> None:
     import signal
     import time as _time
 
+    if argv and argv[0] == "_worker":
+        _auto_worker_command(argv[1:])
+        return
+    if argv and argv[0] in {"start", "stop", "restart", "status", "enable", "disable"}:
+        _auto_background_command(argv)
+        return
+
     parser = argparse.ArgumentParser(
         prog="cswap auto",
         description=(
@@ -215,6 +222,8 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cswap auto start                 # run the auto-switcher in the background
+  cswap auto stop                  # stop the background auto-switcher
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -342,6 +351,148 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+def _auto_background_command(argv: list[str]) -> None:
+    """Handle `cswap auto start|stop|restart|status`."""
+    parser = argparse.ArgumentParser(
+        prog="cswap auto",
+        description="Manage the detached background auto-switch worker.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cswap auto start
+  cswap auto status
+  cswap auto stop
+        """,
+    )
+    parser.add_argument(
+        "action",
+        choices=("start", "stop", "restart", "status", "enable", "disable"),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON to stdout",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging in the launched worker",
+    )
+    args = parser.parse_args(argv)
+
+    from claude_swap import background
+
+    def render(st, verb: str) -> None:
+        if args.json:
+            print(json.dumps({
+                "schemaVersion": 1,
+                "action": verb,
+                "background": st.to_json(),
+            }, indent=2))
+            return
+        state = "running" if st.running else "stopped"
+        enabled = "enabled" if st.enabled else "disabled"
+        pid = f", pid {st.pid}" if st.pid and st.running else ""
+        print(f"auto-switch background: {enabled}, {state}{pid}")
+        print(dimmed(f"log: {st.log_path}"))
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
+        action = args.action
+        if action == "enable":
+            action = "start"
+        elif action == "disable":
+            action = "stop"
+
+        if action == "start":
+            st = background.start(switcher.backup_dir, debug=args.debug)
+        elif action == "stop":
+            st = background.stop(switcher.backup_dir)
+        elif action == "restart":
+            background.stop(switcher.backup_dir)
+            st = background.start(switcher.backup_dir, debug=args.debug)
+        else:
+            st = background.status(switcher.backup_dir)
+        render(st, action)
+    except ClaudeSwitchError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if args.json else sys.stdout,
+        )
+        sys.exit(130)
+
+
+def _auto_worker_command(argv: list[str]) -> None:
+    """Internal foreground worker used by `cswap auto start`."""
+    import signal
+    import time as _time
+
+    parser = argparse.ArgumentParser(prog="cswap auto _worker", add_help=False)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args(argv)
+
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.printer import accent, yellowed
+    from claude_swap.settings import load_settings
+
+    def human_emit(event: AutoSwitchEvent) -> None:
+        stamp = _time.strftime("%Y-%m-%d %H:%M:%S")
+        line = event.human()
+        if event.kind == "switch":
+            line = accent(line)
+        elif event.kind in ("error", "account-quarantined"):
+            line = yellowed(line)
+        elif event.kind in ("poll", "no-switch", "sleep"):
+            line = dimmed(line)
+        print(f"{stamp}  {line}", flush=True)
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        if sys.platform != "win32":
+            if os.geteuid() == 0 and not switcher._is_running_in_container():
+                error("Error: Do not run this script as root (unless running in a container)")
+                sys.exit(1)
+
+        settings = load_settings(switcher.backup_dir)
+        if not settings.enabled:
+            print("auto-switch background disabled; worker exiting", flush=True)
+            sys.exit(0)
+
+        engine = AutoSwitchEngine(switcher, settings, human_emit)
+        signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        print(
+            dimmed(
+                f"Auto-switch background worker running: "
+                f"strategy {settings.strategy}, threshold {settings.threshold:.0f}%, "
+                f"every {settings.interval_seconds:.0f}s"
+            ),
+            flush=True,
+        )
+        sys.exit(
+            engine.run_loop(
+                settings_loader=lambda: load_settings(switcher.backup_dir),
+                should_continue=lambda current: current.enabled,
+            )
+        )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Auto-switch stopped')}")
+        sys.exit(130)
+
+
 def _config_command(argv: list[str]) -> None:
     """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
 
@@ -361,8 +512,10 @@ def _config_command(argv: list[str]) -> None:
         unset_setting,
     )
 
+    key_w = max(len(spec.dotted) for spec in SETTING_SPECS.values()) + 2
     key_lines = "\n".join(
-        f"  {spec.dotted:<34}{spec.help} (default {format_setting_value(spec.default)})"
+        f"  {spec.dotted:<{key_w}}"
+        f"{spec.help} (default {format_setting_value(spec.default)})"
         for spec in SETTING_SPECS.values()
     )
     parser = argparse.ArgumentParser(
@@ -379,7 +532,9 @@ Keys:
 Examples:
   cswap config                              # list effective settings
   cswap config get autoswitch.threshold
+  cswap config set autoswitch.enabled true
   cswap config set autoswitch.threshold 80
+  cswap config set autoswitch.rebalance true
   cswap config unset autoswitch.threshold   # back to the default
   cswap config path                         # where settings.json lives
         """,
@@ -467,10 +622,26 @@ Examples:
         elif action == "set":
             value = set_setting(root, args.key, args.value)
             print(f"{args.key} = {format_setting_value(value)}")
+            if args.key == "autoswitch.enabled":
+                from claude_swap import background
+
+                st = (
+                    background.start(root, debug=args.debug)
+                    if value
+                    else background.stop(root)
+                )
+                state = "running" if st.running else "stopped"
+                print(dimmed(f"auto-switch background: {state}"))
         elif action == "unset":
             if unset_setting(root, args.key):
                 default = setting_spec(args.key).default
                 print(f"{args.key} unset (default: {format_setting_value(default)})")
+                if args.key == "autoswitch.enabled":
+                    from claude_swap import background
+
+                    st = background.stop(root, persist=False)
+                    state = "running" if st.running else "stopped"
+                    print(dimmed(f"auto-switch background: {state}"))
             else:
                 print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
     except ClaudeSwitchError as e:
