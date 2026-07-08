@@ -57,15 +57,15 @@ BACKOFF_CAP_S = 600.0
 # two-account/one-IP probe; both scope per-account), told apart by the
 # Retry-After value:
 # - "Retry-After: 0" = the sustained/edge rule: the account's overall Claude
-#   Code activity has its budget at the edge; retries are penalty-free and
-#   ~every other one succeeds. Long exponential backoff only costs freshness
-#   during exactly the heavy-burn periods where it matters most, so edge
-#   backoff is capped low.
+#   Code activity has its budget at the edge. Retrying immediately is allowed,
+#   but in active multi-session use it often keeps returning 429. Back off
+#   normally, capped at 10 minutes, so stale-on-error display is tolerated
+#   instead of turning the usage meter into its own noisy workload.
 # - "Retry-After: N>0" = the burst rule (~5 rapid requests on one account →
 #   hard 300s block; measured: accurate, counts down, not extended by
 #   probing). Honored as the wait, up to a safety cap so a pathological
 #   header can never park an account for hours.
-EDGE_BACKOFF_CAP_S = 120.0
+EDGE_BACKOFF_CAP_S = 600.0
 RETRY_AFTER_FLOOR_CAP_S = 900.0
 
 # (email, organizationUuid) — the identity a slot number currently maps to.

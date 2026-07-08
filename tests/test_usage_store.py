@@ -194,10 +194,10 @@ class TestBackoff:
         assert BACKOFF_BASE_S * 2**4 == 480.0
 
     def test_edge_429_backoff_capped(self, store, clock):
-        # "Retry-After: 0" is the sustained/edge rule: retries are penalty-free
-        # and ~every other one succeeds, so backoff must stay tight instead of
-        # doubling to BACKOFF_CAP_S — freshness matters most during heavy burn.
-        expected = [30.0, 60.0, 120.0, 120.0, 120.0]
+        # "Retry-After: 0" is the sustained/edge rule. The server permits retry,
+        # but busy accounts can keep returning 429, so repeated failures cool
+        # down to the normal 10 minute cap.
+        expected = [30.0, 60.0, 120.0, 240.0, 480.0, 600.0, 600.0]
         for i, want in enumerate(expected):
             store.record(
                 {"1": FetchRecord(error="http-429", retry_after_s=0.0)}, IDENT

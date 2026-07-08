@@ -414,6 +414,26 @@ class TestRunAction:
 
 @pytest.mark.asyncio
 class TestDashboard:
+    async def test_dashboard_reads_store_when_background_worker_runs(
+        self, tmp_path, monkeypatch
+    ):
+        class Status:
+            running = True
+
+        monkeypatch.setattr(
+            "claude_swap.tui.app.background.status", lambda _backup: Status()
+        )
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+
+        assert app._store_only is True
+        assert fake.fetch_sets[0] == set()
+
     async def test_panel_shows_active_full_and_others_mini(self, tmp_path):
         fake = FakeSwitcher(
             [

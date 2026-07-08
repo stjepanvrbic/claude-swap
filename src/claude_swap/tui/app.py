@@ -14,6 +14,7 @@ from textual.app import App
 from textual.reactive import reactive
 from textual.worker import WorkerState
 
+from claude_swap import background
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import load_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -46,7 +47,10 @@ class CswapApp(App):
         self.switcher = switcher
         self._start = start  # "dashboard" | "watch" (`cswap watch`)
         self.source = SnapshotSource(switcher)
-        self._store_only = False
+        try:
+            self._store_only = background.status(switcher.backup_dir).running
+        except Exception:
+            self._store_only = False
         self._full_next = False
         self._refreshing = False
         self._last_refresh_error = ""
@@ -86,7 +90,7 @@ class CswapApp(App):
         )
 
     def _refresh_blocking(self, full: bool, store_only: bool) -> None:
-        snap = self.source.take(full=full, store_only=store_only)
+        snap = self.source.take(full=full, store_only=store_only and not full)
         self.call_from_thread(self._apply_snapshot, snap)
 
     def _apply_snapshot(self, snap: AccountsSnapshot) -> None:
