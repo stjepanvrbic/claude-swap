@@ -63,6 +63,7 @@ class TestLoadSettings:
                 "intervalSeconds": 1,
                 "hysteresisPct": -5,
                 "rebalanceMinImprovementPct": 200,
+                "rebalanceCooldownSeconds": 90000,
                 "unhealthyTicks": 0,
             }
         }))
@@ -71,6 +72,7 @@ class TestLoadSettings:
         assert loaded.interval_seconds == 15.0  # usage-cache TTL floor
         assert loaded.hysteresis_pct == 0.0
         assert loaded.rebalance_min_improvement_pct == 50.0
+        assert loaded.rebalance_cooldown_seconds == 86400.0
         assert loaded.unhealthy_ticks == 1
 
     def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
@@ -81,17 +83,24 @@ class TestLoadSettings:
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
-    def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
+    def test_unsupported_strategy_falls_back_to_default(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "chaos"}})
         )
-        assert load_settings(tmp_path).strategy == "best"
+        assert load_settings(tmp_path).strategy == AutoSwitchSettings().strategy
 
     def test_fable_best_strategy_is_supported(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "fable-best"}})
         )
         assert load_settings(tmp_path).strategy == "fable-best"
+
+    def test_lowest_strategies_are_supported(self, tmp_path: Path):
+        for strategy in ("lowest", "lowest-fable"):
+            settings_path(tmp_path).write_text(
+                json.dumps({"autoswitch": {"strategy": strategy}})
+            )
+            assert load_settings(tmp_path).strategy == strategy
 
 
 class TestSaveSettings:
@@ -163,6 +172,11 @@ class TestSetUnsetSetting:
 
     def test_set_accepts_fable_best_strategy(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.strategy", "fable-best") == "fable-best"
+        assert set_setting(tmp_path, "autoswitch.strategy", "lowest") == "lowest"
+        assert (
+            set_setting(tmp_path, "autoswitch.strategy", "lowest-fable")
+            == "lowest-fable"
+        )
 
     def test_set_on_corrupt_file_raises_and_preserves_it(self, tmp_path: Path):
         settings_path(tmp_path).write_text("{not json")
@@ -196,7 +210,7 @@ class TestEffectiveSettings:
         assert all(not is_set for _, _, is_set in rows)
 
     def test_presence_not_value_equality_marks_set(self, tmp_path: Path):
-        set_setting(tmp_path, "autoswitch.threshold", "90")  # equals default
+        set_setting(tmp_path, "autoswitch.threshold", "95")  # equals default
         by_key = {spec.dotted: is_set for spec, _, is_set in effective_settings(tmp_path)}
         assert by_key["autoswitch.threshold"] is True
         assert by_key["autoswitch.intervalSeconds"] is False

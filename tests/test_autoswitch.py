@@ -156,7 +156,7 @@ class EngineHarness:
 
 @pytest.fixture
 def harness(temp_home: Path) -> EngineHarness:
-    h = EngineHarness(temp_home)
+    h = EngineHarness(temp_home, strategy="best", interval_seconds=60)
     h.seed(1, "a@example.com")
     h.seed(2, "b@example.com")
     h.seed(3, "c@example.com")
@@ -204,9 +204,26 @@ class TestDecisionTable:
         assert event.reason == "below-threshold"
         assert "10 pct" in event.detail
 
+    def test_rebalance_cooldown_blocks_early_balance_only(self, temp_home):
+        h = EngineHarness(temp_home, rebalance=True, rebalance_min_improvement_pct=10)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text(json.dumps({
+            "lastSwitchAt": h.clock(),
+        }))
+
+        outcome = h.tick_with_usage({"1": _usage(40), "2": _usage(10)})
+
+        assert outcome is TickOutcome.NO_ACTION
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "rebalance-cooldown"
+
     def test_rebalance_respects_hysteresis_bar(self, temp_home):
         h = EngineHarness(
             temp_home,
+            strategy="best",
+            threshold=90,
             rebalance=True,
             rebalance_min_improvement_pct=0,
         )
@@ -230,6 +247,65 @@ class TestDecisionTable:
             "1": _usage(20, fable_pct=50),
             "2": _usage(10, fable_pct=45),
             "3": _usage(20, fable_pct=10),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_lowest_threshold_switch_ignores_old_hysteresis_bar(self, temp_home):
+        h = EngineHarness(temp_home, strategy="lowest")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({"1": _usage(95), "2": _usage(90)})
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_lowest_treats_80_percent_weekly_as_fresh_session(self, temp_home):
+        h = EngineHarness(temp_home, strategy="lowest")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": {"five_hour": {"pct": 95}, "seven_day": {"pct": 10}},
+            "2": {"five_hour": {"pct": 0}, "seven_day": {"pct": 80}},
+            "3": {"five_hour": {"pct": 20}, "seven_day": {"pct": 20}},
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_lowest_fable_treats_60_percent_fable_as_fresh(self, temp_home):
+        h = EngineHarness(temp_home, strategy="lowest-fable")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(10, fable_pct=95),
+            "2": _usage(0, fable_pct=60),
+            "3": _usage(0, fable_pct=80),
+        })
+
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_lowest_fable_uses_weighted_fable_pressure(self, temp_home):
+        h = EngineHarness(temp_home, strategy="lowest-fable")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+
+        outcome = h.tick_with_usage({
+            "1": _usage(10, fable_pct=96),
+            "2": _usage(0, fable_pct=80),
+            "3": _usage(15, fable_pct=60),
         })
 
         assert outcome is TickOutcome.SWITCHED
@@ -306,12 +382,12 @@ class TestDecisionTable:
         ]
 
     def test_hysteresis_bar_blocks_marginal_candidates(self, harness):
-        # threshold 90, hysteresis 10 → candidates must sit at <= 80% used.
+        # threshold 95, hysteresis 10 -> candidates must sit at <= 85% used.
         # Failing the bar is NOT exhaustion: no all-exhausted event, no
-        # reset-sleep — the next tick must stay at normal cadence so the
+        # reset-sleep - the next tick must stay at normal cadence so the
         # at-limit escape isn't missed when the active account tops out.
         outcome = harness.tick_with_usage({
-            "1": _usage(95), "2": _usage(85), "3": _usage(88),
+            "1": _usage(95), "2": _usage(86), "3": _usage(88),
         })
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
@@ -446,9 +522,9 @@ class TestDecisionTable:
         assert harness.active_number() == 2
 
     def test_candidate_not_better_than_active_is_skipped(self, harness):
-        # Active 91% used (9 headroom); candidates worse or equal → exhausted.
+        # Active 96% used (4 headroom); candidates worse or equal are skipped.
         outcome = harness.tick_with_usage({
-            "1": _usage(91), "2": _usage(95), "3": _usage(99),
+            "1": _usage(96), "2": _usage(97), "3": _usage(99),
         })
         assert outcome is TickOutcome.BLOCKED
         assert harness.active_number() == 1
@@ -567,6 +643,8 @@ class TestAdaptiveScheduler:
 
     def _harness(self, temp_home, monkeypatch, accounts=3, **settings_kwargs):
         monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+        settings_kwargs.setdefault("strategy", "best")
+        settings_kwargs.setdefault("interval_seconds", 60)
         h = EngineHarness(temp_home, **settings_kwargs)
         emails = ["a@example.com", "b@example.com", "c@example.com"]
         for num in range(1, accounts + 1):
@@ -598,7 +676,7 @@ class TestAdaptiveScheduler:
 
     def test_baseline_fetches_active_plus_one_candidate(self, temp_home, monkeypatch):
         h = self._harness(temp_home, monkeypatch)
-        usage = {"1": _usage(50), "2": _usage(10), "3": _usage(20)}
+        usage = {"1": _usage(55), "2": _usage(10), "3": _usage(20)}
         counts: dict[str, int] = {}
         for expected in ({"1": 1, "2": 1}, {"1": 2, "2": 1, "3": 1},
                          {"1": 3, "2": 2, "3": 1}):
@@ -607,7 +685,7 @@ class TestAdaptiveScheduler:
             h.clock.advance(60)
 
     def test_near_threshold_escalates_to_full_refresh(self, temp_home, monkeypatch):
-        # threshold 90, margin 15 → active at 80% is within the escalation band.
+        # threshold 95, margin 15 -> active at 80% is within the escalation band.
         h = self._harness(temp_home, monkeypatch)
         counts: dict[str, int] = {}
         outcome = self._tick(
@@ -657,7 +735,7 @@ class TestAdaptiveScheduler:
         assert counts["1"] == 2
 
     def test_active_in_band_polls_every_tick(self, temp_home, monkeypatch):
-        # threshold 90, margin 15 → 80% is in the band: cadence never relaxes.
+        # threshold 95, margin 15 -> 80% is in the band: cadence never relaxes.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(80), "2": _usage(10)}
         counts: dict[str, int] = {}

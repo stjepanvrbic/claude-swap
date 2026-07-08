@@ -24,7 +24,7 @@ from claude_swap.exceptions import ConfigError
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
-AUTOSWITCH_STRATEGIES = ("best", "fable-best")
+AUTOSWITCH_STRATEGIES = ("best", "fable-best", "lowest", "lowest-fable")
 SWITCH_STRATEGIES = ("best", "next-available", "fable-best")
 
 _logger = logging.getLogger("claude-swap")
@@ -34,22 +34,21 @@ _logger = logging.getLogger("claude-swap")
 class AutoSwitchSettings:
     """Policy knobs for the auto-switch engine (``cswap auto``).
 
-    ``threshold`` is binding-window utilization (max of the 5h/7d percentages):
-    at or above it the engine looks for a better account. 90 rather than 95
-    leaves margin for the macOS ~30s Keychain pickup tail and for heavy
-    subagent turns burning past the mark before a swap lands. A candidate only
-    qualifies while its own utilization sits at least ``hysteresis_pct`` below
-    the threshold, so two accounts hovering at the line never ping-pong.
+    ``threshold`` is binding-window utilization. With the lowest strategies,
+    that means raw 5h/7d usage (plus Fable for lowest-fable) crossing the
+    configured threshold; weighted pressure is used only to rank targets and
+    to rebalance early.
     """
 
     enabled: bool = False
-    threshold: float = 90.0
-    interval_seconds: float = 60.0
+    threshold: float = 95.0
+    interval_seconds: float = 15.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"
+    strategy: str = "lowest"
     rebalance: bool = False
-    rebalance_min_improvement_pct: float = 10.0
+    rebalance_min_improvement_pct: float = 20.0
+    rebalance_cooldown_seconds: float = 600.0
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
 
@@ -119,6 +118,11 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "rebalanceMinImprovementPct",
             "rebalance_min_improvement_pct", "float", 0.0, 50.0,
             help="Extra headroom required before an early rebalance switch",
+        ),
+        SettingSpec(
+            "autoswitch", "rebalanceCooldownSeconds",
+            "rebalance_cooldown_seconds", "float", 0.0, 86400.0,
+            help="Minimum seconds between early rebalance switches",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",

@@ -49,11 +49,12 @@ class TestConfigList:
             "autoswitch.strategy",
             "autoswitch.rebalance",
             "autoswitch.rebalanceMinImprovementPct",
+            "autoswitch.rebalanceCooldownSeconds",
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
         ):
             assert key in out
-        assert out.count("(default)") == 10
+        assert out.count("(default)") == 11
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -80,11 +81,13 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 10
+        assert len(by_key) == 11
         assert by_key["autoswitch.enabled"]["value"] is False
-        assert by_key["autoswitch.threshold"]["value"] == 90.0
+        assert by_key["autoswitch.threshold"]["value"] == 95.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.rebalance"]["value"] is False
+        assert by_key["autoswitch.rebalanceMinImprovementPct"]["value"] == 20.0
+        assert by_key["autoswitch.rebalanceCooldownSeconds"]["value"] == 600.0
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
 
 
@@ -209,15 +212,14 @@ class TestConfigValidation:
     def test_bad_strategy_exits_1(self, temp_home, capsys):
         code, _, err = _run(["set", "autoswitch.strategy", "chaos"], capsys)
         assert code == 1
-        assert "must be one of: best, fable-best" in err
+        assert "must be one of: best, fable-best, lowest, lowest-fable" in err
 
-    def test_fable_best_strategy_is_accepted(self, temp_home, capsys):
-        code, out, err = _run(
-            ["set", "autoswitch.strategy", "fable-best"], capsys
-        )
+    @pytest.mark.parametrize("strategy", ["fable-best", "lowest", "lowest-fable"])
+    def test_extra_strategies_are_accepted(self, temp_home, capsys, strategy):
+        code, out, err = _run(["set", "autoswitch.strategy", strategy], capsys)
         assert code == 0
         assert err == ""
-        assert "fable-best" in out
+        assert strategy in out
 
     def test_unknown_key_json_error_envelope(self, temp_home, capsys):
         code, out, _ = _run(["--json", "get", "autoswitch.bogus"], capsys)
@@ -257,9 +259,9 @@ class TestConfigUnset:
         _run(["set", "autoswitch.threshold", "80"], capsys)
         code, out, _ = _run(["unset", "autoswitch.threshold"], capsys)
         assert code == 0
-        assert "default: 90" in out
+        assert "default: 95" in out
         code, out, _ = _run(["get", "autoswitch.threshold"], capsys)
-        assert out.strip() == "90"
+        assert out.strip() == "95"
         # The emptied autoswitch section is removed entirely.
         raw = json.loads(_settings_file(capsys).read_text())
         assert "autoswitch" not in raw

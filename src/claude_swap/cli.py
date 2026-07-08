@@ -217,8 +217,8 @@ Exit codes with --once:
   3  blocked: wanted to switch but no viable target / all exhausted
 
 Examples:
-  cswap auto                       # foreground loop, switch at 90%% used
-  cswap auto --threshold 80        # switch earlier
+  cswap auto                       # foreground loop, switch at 95%% used
+  cswap auto --strategy lowest     # balance immediate 5h capacity first
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -242,7 +242,7 @@ Defaults live in settings.json in the backup root; flags override them.
         "--interval",
         type=float,
         metavar="SECONDS",
-        help="Poll interval in loop mode (min 15; default 60)",
+        help="Poll interval in loop mode (min 15; default 15)",
     )
     parser.add_argument(
         "--threshold",
@@ -250,8 +250,8 @@ Defaults live in settings.json in the backup root; flags override them.
         metavar="PCT",
         help=(
             "Switch when the active account's binding usage reaches this "
-            "utilization (5h/7d, plus Fable when strategy=fable-best; "
-            "50-99.9; default 90)"
+            "utilization (5h/7d, plus Fable when strategy includes Fable; "
+            "50-99.9; default 95)"
         ),
     )
     parser.add_argument(
@@ -263,10 +263,11 @@ Defaults live in settings.json in the backup root; flags override them.
     parser.add_argument(
         "--strategy",
         choices=AUTOSWITCH_STRATEGIES,
-        metavar="{best,fable-best}",
+        metavar="{best,fable-best,lowest,lowest-fable}",
         help=(
             "Target selection strategy. 'best' maximizes 5h/7d headroom; "
-            "'fable-best' prefers Fable weekly headroom among viable accounts."
+            "'fable-best' prefers Fable weekly headroom; 'lowest' and "
+            "'lowest-fable' minimize weighted usage pressure."
         ),
     )
     parser.add_argument(

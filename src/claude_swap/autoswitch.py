@@ -325,6 +325,9 @@ def _refresh_fingerprint(credentials: str) -> str | None:
 
 def strategy_headroom(usage: dict | None, strategy: str = "best") -> float | None:
     """Decision headroom for the active auto-switch strategy."""
+    if strategy in ("lowest", "lowest-fable"):
+        utilization = _lowest_relevant_usage(usage, include_fable=strategy == "lowest-fable")
+        return None if utilization is None else 100.0 - utilization
     rate_headroom = oauth.account_headroom(usage)
     if strategy != "fable-best":
         return rate_headroom
@@ -340,6 +343,9 @@ def strategy_headroom(usage: dict | None, strategy: str = "best") -> float | Non
 
 def strategy_score(usage: dict | None, strategy: str = "best") -> tuple[float, ...] | None:
     """Comparable score for choosing a target under an auto-switch strategy."""
+    if strategy in ("lowest", "lowest-fable"):
+        pressure = _lowest_pressure(usage, include_fable=strategy == "lowest-fable")
+        return None if pressure is None else (100.0 - pressure,)
     rate_headroom = oauth.account_headroom(usage)
     if rate_headroom is None:
         return None
@@ -349,6 +355,76 @@ def strategy_score(usage: dict | None, strategy: str = "best") -> tuple[float, .
     if fable_headroom is None:
         return None
     return (fable_headroom, rate_headroom)
+
+
+def _window_pct(usage: dict | None, key: str) -> float | None:
+    if not isinstance(usage, dict):
+        return None
+    window = usage.get(key)
+    if not isinstance(window, dict):
+        return None
+    pct = window.get("pct")
+    return float(pct) if isinstance(pct, (int, float)) else None
+
+
+def _fable_pct(usage: dict | None) -> float | None:
+    headroom = oauth.scoped_model_headroom(usage, FABLE_MODEL_NAME)
+    return None if headroom is None else 100.0 - headroom
+
+
+def _long_window_penalty(pct: float | None) -> float | None:
+    """Penalty for slow quota windows that should not dominate until high."""
+    if pct is None:
+        return 0.0
+    if pct <= 85.0:
+        return 0.0
+    if pct <= 95.0:
+        return pct - 85.0
+    return 10.0 + 20.0 * (pct - 95.0)
+
+
+def _fable_penalty(pct: float | None) -> float | None:
+    if pct is None:
+        return None
+    if pct <= 60.0:
+        return 0.0
+    if pct <= 85.0:
+        return pct - 60.0
+    if pct <= 95.0:
+        return 25.0 + 3.0 * (pct - 85.0)
+    return 55.0 + 20.0 * (pct - 95.0)
+
+
+def _lowest_pressure(usage: dict | None, *, include_fable: bool) -> float | None:
+    """Weighted pressure for lowest/lowest-fable target ranking.
+
+    Five-hour usage is immediate capacity and counts directly. Seven-day and
+    Fable pressure only ramp once they are meaningfully high, because a high
+    weekly percentage can still leave a full useful 5h session.
+    """
+    five_hour = _window_pct(usage, "five_hour")
+    if five_hour is None:
+        return None
+    seven_day = _window_pct(usage, "seven_day")
+    pressure = five_hour + _long_window_penalty(seven_day)
+    if include_fable:
+        fable = _fable_penalty(_fable_pct(usage))
+        if fable is None:
+            return None
+        pressure += fable
+    return pressure
+
+
+def _lowest_relevant_usage(usage: dict | None, *, include_fable: bool) -> float | None:
+    pcts = [
+        pct for pct in (
+            _window_pct(usage, "five_hour"),
+            _window_pct(usage, "seven_day"),
+            _fable_pct(usage) if include_fable else None,
+        )
+        if pct is not None
+    ]
+    return max(pcts) if pcts else None
 
 
 def binding_pct(usage: dict | None, strategy: str = "best") -> float | None:
@@ -723,8 +799,11 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "rebalance") and self._in_cooldown(state):
+        if trigger == "proactive" and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
+            return TickOutcome.NO_ACTION
+        if trigger == "rebalance" and self._in_rebalance_cooldown(state):
+            self._emit(NoSwitchEvent(reason="rebalance-cooldown"))
             return TickOutcome.NO_ACTION
 
         # -- candidate selection ------------------------------------------
@@ -752,6 +831,7 @@ class AutoSwitchEngine:
         qualifying: list[tuple[tuple[float, ...], str]] = []
         any_known = False
         any_strategy_known = False
+        lowest_strategy = settings.strategy in ("lowest", "lowest-fable")
         active_score = strategy_score(
             active_value if isinstance(active_value, dict) else None,
             settings.strategy,
@@ -771,7 +851,14 @@ class AutoSwitchEngine:
             any_strategy_known = True
             if h <= 0:
                 continue  # itself at its limit — never a target
-            if trigger in ("proactive", "rebalance"):
+            if settings.strategy == "lowest-fable":
+                fable_h = oauth.scoped_model_headroom(
+                    value if isinstance(value, dict) else None,
+                    FABLE_MODEL_NAME,
+                )
+                if fable_h is None or fable_h <= 0:
+                    continue
+            if trigger in ("proactive", "rebalance") and not lowest_strategy:
                 # Hysteresis guards optional moves: two accounts hovering at
                 # the line must not ping-pong. At-limit and failover are
                 # escapes - any account with real headroom beats a blocked or
@@ -779,7 +866,10 @@ class AutoSwitchEngine:
                 if (100.0 - h) > hysteresis_bar:
                     continue
             if trigger == "proactive":
-                if active_headroom is not None and h <= active_headroom:
+                if lowest_strategy:
+                    if active_score is not None and score <= active_score:
+                        continue  # not provably better than where we are
+                elif active_headroom is not None and h <= active_headroom:
                     continue  # not provably better than where we are
             elif trigger == "rebalance":
                 if active_score is None:
@@ -808,7 +898,7 @@ class AutoSwitchEngine:
             if not any_known or not any_strategy_known:
                 detail = (
                     "no candidate has readable Fable usage"
-                    if settings.strategy == "fable-best"
+                    if settings.strategy in ("fable-best", "lowest-fable")
                     else "no candidate has readable usage"
                 )
                 self._emit(
@@ -1059,6 +1149,9 @@ class AutoSwitchEngine:
             if trigger == "proactive" and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
+            if trigger == "rebalance" and self._in_rebalance_cooldown(state):
+                self._emit(NoSwitchEvent(reason="rebalance-cooldown"))
+                return TickOutcome.NO_ACTION
 
             result = self.switcher.switch_to(number, json_output=True)
             if not result or not result.get("switched"):
@@ -1092,6 +1185,12 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _in_rebalance_cooldown(self, state: dict) -> bool:
+        last = state.get("lastSwitchAt")
+        if not isinstance(last, (int, float)):
+            return False
+        return (self.clock() - last) < self.settings.rebalance_cooldown_seconds
 
     @staticmethod
     def _earliest_reset(usage: dict[str, dict | str | None]) -> datetime | None:
