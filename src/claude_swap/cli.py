@@ -204,9 +204,10 @@ def _auto_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog="cswap auto",
         description=(
-            "Automatically switch accounts when the active one nears its "
-            "5h/7d rate limit. Runs a foreground polling loop; use --once "
-            "for a single tick (cron-friendly)."
+            "Automatically switch to the eligible account whose Fable reset "
+            "is soonest (then weekly/5h fallback). The active account hands "
+            "off when any quota reaches its configured limit. Runs a "
+            "foreground polling loop; use --once for one tick."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
@@ -217,8 +218,8 @@ Exit codes with --once:
   3  blocked: wanted to switch but no viable target / all exhausted
 
 Examples:
-  cswap auto                       # foreground loop, switch at 95%% used
-  cswap auto --strategy lowest     # balance immediate 5h capacity first
+  cswap auto                       # foreground loop (5h 95%, 7d/Fable 98%)
+  cswap auto --fable-threshold 95  # lower the Fable handoff limit for this run
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
@@ -249,25 +250,41 @@ Defaults live in settings.json in the backup root; flags override them.
         type=float,
         metavar="PCT",
         help=(
-            "Switch when the active account's binding usage reaches this "
-            "utilization (5h/7d, plus Fable when strategy includes Fable; "
-            "50-99.9; default 95)"
+            "Deprecated alias for --five-hour-threshold (50-99.9); "
+            "weekly and Fable limits are unchanged"
         ),
+    )
+    parser.add_argument(
+        "--five-hour-threshold",
+        type=float,
+        metavar="PCT",
+        help="5-hour handoff limit (50-99.9; default 95)",
+    )
+    parser.add_argument(
+        "--seven-day-threshold",
+        type=float,
+        metavar="PCT",
+        help="7-day handoff limit (50-99.9; default 98)",
+    )
+    parser.add_argument(
+        "--fable-threshold",
+        type=float,
+        metavar="PCT",
+        help="Fable handoff limit (50-99.9; default 98)",
     )
     parser.add_argument(
         "--cooldown",
         type=float,
         metavar="SECONDS",
-        help="Minimum time between proactive switches (default 300)",
+        help="Deprecated compatibility option; reset-first handoffs are immediate",
     )
     parser.add_argument(
         "--strategy",
         choices=AUTOSWITCH_STRATEGIES,
-        metavar="{best,fable-best,lowest,lowest-fable}",
+        metavar="{reset-first,best,fable-best,lowest,lowest-fable}",
         help=(
-            "Target selection strategy. 'best' maximizes 5h/7d headroom; "
-            "'fable-best' prefers Fable weekly headroom; 'lowest' and "
-            "'lowest-fable' minimize weighted usage pressure."
+            "Deprecated automatic alias; all values now use reset-first "
+            "ordering (Fable reset, then weekly/5h fallback)."
         ),
     )
     parser.add_argument(
@@ -317,6 +334,10 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        if args.strategy and not args.json:
+            print(dimmed("warning: automatic --strategy is deprecated; using reset-first"))
+        if args.threshold is not None and not args.json:
+            print(dimmed("warning: --threshold is deprecated; use --five-hour-threshold"))
         engine = AutoSwitchEngine(
             switcher,
             settings,
@@ -332,7 +353,9 @@ Defaults live in settings.json in the backup root; flags override them.
         if not args.json:
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    f"Auto-switch running: 5h {settings.five_hour_threshold:.0f}%, "
+                    f"7d {settings.seven_day_threshold:.0f}%, "
+                    f"Fable {settings.fable_threshold:.0f}%, "
                     f"every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
@@ -475,7 +498,9 @@ def _auto_worker_command(argv: list[str]) -> None:
         print(
             dimmed(
                 f"Auto-switch background worker running: "
-                f"strategy {settings.strategy}, threshold {settings.threshold:.0f}%, "
+                f"reset-first policy (5h {settings.five_hour_threshold:.0f}%, "
+                f"7d {settings.seven_day_threshold:.0f}%, "
+                f"Fable {settings.fable_threshold:.0f}%), "
                 f"every {settings.interval_seconds:.0f}s"
             ),
             flush=True,
@@ -532,11 +557,12 @@ Keys:
 
 Examples:
   cswap config                              # list effective settings
-  cswap config get autoswitch.threshold
+  cswap config get autoswitch.fiveHourThreshold
   cswap config set autoswitch.enabled true
-  cswap config set autoswitch.threshold 80
-  cswap config set autoswitch.rebalance true
-  cswap config unset autoswitch.threshold   # back to the default
+  cswap config set autoswitch.fiveHourThreshold 95
+  cswap config set autoswitch.sevenDayThreshold 98
+  cswap config set autoswitch.fableThreshold 98
+  cswap config unset autoswitch.fableThreshold   # back to the default
   cswap config path                         # where settings.json lives
         """,
     )
@@ -554,7 +580,10 @@ Examples:
 
     p_list = sub.add_parser("list", help="Show all effective settings (the default)")
     p_get = sub.add_parser("get", help="Print one setting's effective value")
-    p_get.add_argument("key", metavar="KEY", help="Dotted key, e.g. autoswitch.threshold")
+    p_get.add_argument(
+        "key", metavar="KEY",
+        help="Dotted key, e.g. autoswitch.fiveHourThreshold",
+    )
     for p in (p_list, p_get):
         # SUPPRESS: without it the subparser's False default would clobber a
         # pre-verb `cswap config --json` in the shared namespace.
@@ -726,7 +755,7 @@ Commands:
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
   %(prog)s remove <num|email>         remove an account
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
-  %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s auto                       reset-first auto-switching by quota reset
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
@@ -748,7 +777,9 @@ Aliases: ls=list  rm=remove  update=upgrade""",
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
-  %(prog)s config set autoswitch.threshold 80
+  %(prog)s config set autoswitch.fiveHourThreshold 95
+  %(prog)s config set autoswitch.sevenDayThreshold 98
+  %(prog)s config set autoswitch.fableThreshold 98
 
 The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
         """,

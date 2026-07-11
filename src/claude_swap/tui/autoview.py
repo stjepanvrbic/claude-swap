@@ -3,17 +3,18 @@
 Runs :class:`AutoSwitchEngine` in a thread worker and renders its typed
 events. Opens in **dry-run** — opening a view must never start switching
 accounts on its own; going live is an explicit, confirmed action. The
-engine's own state file semantics (shared cooldown, quarantine list, state
+engine's own state file semantics (shared quarantine list and state
 lock) make it safe to run alongside an external ``cswap auto``.
 
 The active account's full card sits on top (same widget as the dashboard's
-panel, with the threshold tick); this screen adds the engine badge, the
+panel, with per-window threshold ticks); this screen adds the engine badge, the
 ranked switch candidates, and the decision log. While it is up, the app's
 snapshot poller runs store-only: the engine is the only fetcher.
 """
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
 
 from rich.text import Text
@@ -23,7 +24,12 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
-from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, binding_pct
+from claude_swap.autoswitch import (
+    AutoSwitchEngine,
+    AutoSwitchEvent,
+    _policy_candidate_key,
+    binding_pct,
+)
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import load_settings
 from claude_swap.tui import data
@@ -91,7 +97,9 @@ class AutoScreen(Screen):
         self._settings = load_settings(self.app.switcher.backup_dir)
         summary = self.query_one("#auto-summary", Static)
         summary.update(
-            f"auto-switch · threshold {self._settings.threshold:.0f}% · "
+            f"auto-switch · 5h {self._settings.five_hour_threshold:.0f}% · "
+            f"7d {self._settings.seven_day_threshold:.0f}% · "
+            f"Fable {self._settings.fable_threshold:.0f}% · "
             f"poll every {self._settings.interval_seconds:.0f}s"
         )
         self.watch(self.app, "snapshot", self._on_snapshot)
@@ -149,7 +157,7 @@ class AutoScreen(Screen):
             self.app.push_screen(
                 ConfirmModal(
                     "Go live? claude-swap will switch your active account "
-                    "automatically when the threshold is reached.\n\n"
+                    "automatically when any configured quota threshold is reached.\n\n"
                     "(Same behavior as running `cswap auto` in a terminal.)",
                     title="Go live",
                     yes_label="Go live",
@@ -189,9 +197,10 @@ class AutoScreen(Screen):
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked by remaining headroom (best first)."""
-        ranked: list[tuple[float, str]] = []  # (sort key: pct used, number)
+        """Switch targets ranked by reset-first eligibility."""
+        ranked: list[tuple[tuple[int, int, float, int], str]] = []
         lines: dict[str, Text] = {}
+        settings = self._settings or load_settings(self.app.switcher.backup_dir)
         for acc in snap.accounts:
             if acc.number == active_number or not acc.switchable:
                 continue
@@ -203,17 +212,22 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=MUTED
                 )
-                ranked.append((998.0, acc.number))
+                ranked.append(((2, 2, float("inf"), int(acc.number)), acc.number))
             elif pct is None:
                 entry.append("  usage unknown", style=MUTED)
-                ranked.append((999.0, acc.number))
+                ranked.append(((2, 2, float("inf"), int(acc.number)), acc.number))
             else:
                 entry.append(f"  {pct:3.0f}% used", style=severity_color(pct))
-                ranked.append((pct, acc.number))
+                key = _policy_candidate_key(
+                    acc.usage.last_good, settings, time.time(), acc.number
+                )
+                ranked.append(
+                    (key or (2, 2, float("inf"), int(acc.number)), acc.number)
+                )
             lines[acc.number] = entry
 
         text = Text()
-        text.append("Next best", style=MUTED)
+        text.append("Reset-first targets", style=MUTED)
         if not ranked:
             text.append("\n  no other switchable accounts", style=MUTED)
             return text

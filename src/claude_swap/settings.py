@@ -24,7 +24,9 @@ from claude_swap.exceptions import ConfigError
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
-AUTOSWITCH_STRATEGIES = ("best", "fable-best", "lowest", "lowest-fable")
+# Kept for backwards-compatible parsing of old automatic invocations.  The
+# auto engine now applies one reset-first policy for every value.
+AUTOSWITCH_STRATEGIES = ("reset-first", "best", "fable-best", "lowest", "lowest-fable")
 SWITCH_STRATEGIES = ("best", "next-available", "fable-best")
 
 _logger = logging.getLogger("claude-swap")
@@ -34,18 +36,21 @@ _logger = logging.getLogger("claude-swap")
 class AutoSwitchSettings:
     """Policy knobs for the auto-switch engine (``cswap auto``).
 
-    ``threshold`` is binding-window utilization. With the lowest strategies,
-    that means raw 5h/7d usage (plus Fable for lowest-fable) crossing the
-    configured threshold; weighted pressure is used only to rank targets and
-    to rebalance early.
+    Automatic switching uses independent limits for each quota window.  The
+    old ``threshold``/strategy fields remain as compatibility aliases for
+    existing settings files and callers; the engine uses the three explicit
+    limits below.
     """
 
     enabled: bool = False
     threshold: float = 95.0
+    five_hour_threshold: float = 95.0
+    seven_day_threshold: float = 98.0
+    fable_threshold: float = 98.0
     interval_seconds: float = 15.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "lowest"
+    strategy: str = "reset-first"
     rebalance: bool = False
     rebalance_min_improvement_pct: float = 20.0
     rebalance_cooldown_seconds: float = 600.0
@@ -91,7 +96,22 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,
-            help="Switch when the binding 5h/7d window reaches this pct",
+            help="Deprecated alias for fiveHourThreshold",
+        ),
+        SettingSpec(
+            "autoswitch", "fiveHourThreshold", "five_hour_threshold", "float",
+            50.0, 99.9,
+            help="Switch when 5-hour usage reaches this pct",
+        ),
+        SettingSpec(
+            "autoswitch", "sevenDayThreshold", "seven_day_threshold", "float",
+            50.0, 99.9,
+            help="Switch when 7-day usage reaches this pct",
+        ),
+        SettingSpec(
+            "autoswitch", "fableThreshold", "fable_threshold", "float",
+            50.0, 99.9,
+            help="Switch when Fable usage reaches this pct",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -99,30 +119,30 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
-            help="Minimum seconds between proactive switches",
+            help="Deprecated; reset-first threshold handoffs are immediate",
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="A target must sit this many pct below the threshold",
+            help="Deprecated; reset-first selection has no hysteresis",
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
             choices=AUTOSWITCH_STRATEGIES,
-            help="How auto-switch picks the target account",
+            help="Deprecated aliases; automatic selection is reset-first",
         ),
         SettingSpec(
             "autoswitch", "rebalance", "rebalance", "bool",
-            help="Allow background/auto to switch to a much better account early",
+            help="Deprecated; automatic selection waits for a quota threshold",
         ),
         SettingSpec(
             "autoswitch", "rebalanceMinImprovementPct",
             "rebalance_min_improvement_pct", "float", 0.0, 50.0,
-            help="Extra headroom required before an early rebalance switch",
+            help="Deprecated; no early rebalance is performed",
         ),
         SettingSpec(
             "autoswitch", "rebalanceCooldownSeconds",
             "rebalance_cooldown_seconds", "float", 0.0, 86400.0,
-            help="Minimum seconds between early rebalance switches",
+            help="Deprecated; no early rebalance is performed",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
@@ -195,6 +215,19 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
     for field, json_key in _AUTOSWITCH_KEYS.items():
         if json_key in section:
             kwargs[field] = section[json_key]
+    # A pre-reset-first settings file only has ``threshold``.  Preserve that
+    # user's chosen 5h limit while the new weekly/Fable defaults take effect.
+    if "fiveHourThreshold" not in section and "threshold" in section:
+        kwargs["five_hour_threshold"] = section["threshold"]
+    elif "fiveHourThreshold" in section and "threshold" not in section:
+        # Keep the legacy in-memory field coherent for older frontends.
+        kwargs["threshold"] = section["fiveHourThreshold"]
+    legacy_strategy = section.get("strategy")
+    if legacy_strategy in {"best", "fable-best", "lowest", "lowest-fable"}:
+        _logger.warning(
+            "settings.json: automatic strategy %r is deprecated; using reset-first",
+            legacy_strategy,
+        )
     try:
         settings = AutoSwitchSettings(**kwargs)
     except TypeError:
@@ -366,15 +399,25 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     """Overlay non-None CLI overrides (argparse Namespace) onto settings."""
     overrides = {}
     for attr, field in (
-        ("threshold", "threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("strategy", "strategy"),
         ("include_api_key_accounts", "include_api_key_accounts"),
+        ("five_hour_threshold", "five_hour_threshold"),
+        ("seven_day_threshold", "seven_day_threshold"),
+        ("fable_threshold", "fable_threshold"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
             overrides[field] = value
+            if field == "five_hour_threshold":
+                overrides["threshold"] = value
+    # ``--threshold`` is the old spelling and intentionally maps only to the
+    # 5h limit now that weekly and Fable limits are independent.
+    legacy_threshold = getattr(args, "threshold", None)
+    if legacy_threshold is not None:
+        overrides["threshold"] = legacy_threshold
+        overrides["five_hour_threshold"] = legacy_threshold
     if not overrides:
         return settings
     return _clamped(dataclasses.replace(settings, **overrides))

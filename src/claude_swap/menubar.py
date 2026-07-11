@@ -38,7 +38,7 @@ class MenuBarSettings:
     """User-configurable menu bar display behavior, persisted as JSON.
 
     Only display preferences and the auto-switch on/off toggle live here.
-    Auto-switch *policy* (threshold, cooldown, hysteresis, …) is core config,
+    Auto-switch *policy* (per-window limits) is core config,
     read/written through ``claude_swap.settings`` (the ``autoswitch.*`` keys),
     so the CLI and the menu bar share one source of truth.
     """
@@ -468,12 +468,21 @@ def run(switcher) -> int:
                 elif ev.kind == "all-exhausted":
                     rumps.notification("claude-swap", "All accounts exhausted", ev.human())
 
-        def _threshold(self) -> int:
-            """Current auto-switch threshold from core settings (for the menu)."""
+        def _thresholds(self) -> dict[str, int]:
+            """Current reset-first limits from core settings."""
             try:
-                return int(load_settings(self.switcher.backup_dir).threshold)
+                settings = load_settings(self.switcher.backup_dir)
+                return {
+                    "5h": int(settings.five_hour_threshold),
+                    "7d": int(settings.seven_day_threshold),
+                    "Fable": int(settings.fable_threshold),
+                }
             except Exception:
-                return 0
+                return {"5h": 95, "7d": 98, "Fable": 98}
+
+        def _threshold(self) -> int:
+            """Legacy 5h threshold helper retained for integrations."""
+            return self._thresholds()["5h"]
 
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
@@ -568,13 +577,18 @@ def run(switcher) -> int:
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
 
-            threshold_menu = rumps.MenuItem("Auto-switch threshold")
-            current = self._threshold()
-            for pct in AUTO_THRESHOLD_CHOICES:
-                ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
-                ch.state = 1 if current == pct else 0
-                threshold_menu.add(ch)
-            menu.add(threshold_menu)
+            thresholds = self._thresholds()
+            limits_menu = rumps.MenuItem("Auto-switch limits")
+            for label, key in (("5-hour", "5h"), ("7-day", "7d"), ("Fable", "Fable")):
+                window_menu = rumps.MenuItem(f"{label} ({thresholds[key]}%)")
+                for pct in AUTO_THRESHOLD_CHOICES:
+                    ch = rumps.MenuItem(
+                        f"{pct}%", callback=self._make_window_threshold(key, pct)
+                    )
+                    ch.state = 1 if thresholds[key] == pct else 0
+                    window_menu.add(ch)
+                limits_menu.add(window_menu)
+            menu.add(limits_menu)
 
             return menu
 
@@ -724,11 +738,19 @@ def run(switcher) -> int:
             self.rebuild_menu()
 
         def _make_threshold(self, pct):
+            return self._make_window_threshold("5h", pct)
+
+        def _make_window_threshold(self, key, pct):
             def cb(_sender):
                 try:
-                    set_setting(self.switcher.backup_dir, "autoswitch.threshold", str(pct))
+                    setting_key = {
+                        "5h": "autoswitch.fiveHourThreshold",
+                        "7d": "autoswitch.sevenDayThreshold",
+                        "Fable": "autoswitch.fableThreshold",
+                    }[key]
+                    set_setting(self.switcher.backup_dir, setting_key, str(pct))
                 except Exception as e:
-                    rumps.alert(title="claude-swap", message=f"Couldn't set threshold: {e}")
+                    rumps.alert(title="claude-swap", message=f"Couldn't set limit: {e}")
                     return
                 self._restart_engine()  # apply immediately if running
                 self.rebuild_menu()

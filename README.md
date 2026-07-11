@@ -73,18 +73,18 @@ Not sure which one? `cswap list` is the dashboard — every account's 5-hour and
 cswap list
 ```
 
-Or let claude-swap auto-pick by usage — `cswap switch --strategy best` (most 5h/7d quota left), `--strategy next-available` (skip rate-limited accounts), or `--strategy fable-best` (prefer remaining Fable weekly headroom among accounts still usable on 5h/7d).
+Manual usage-aware choices remain available with `cswap switch --strategy best`, `--strategy next-available`, and `--strategy fable-best`. These manual strategies do not affect automatic switching.
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
 ### Automatic switching
 
-Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 95%), it switches before you hit the limit, and safe to run while Claude Code is working. With `autoswitch.strategy=lowest-fable`, Fable can also trigger the threshold and targets are ranked by weighted usage pressure:
+Let claude-swap watch your usage and switch for you. Automatic switching uses one reset-first policy: it prefers an eligible account with the soonest Fable reset, then falls back to the soonest weekly/5-hour reset. It hands off immediately when any active quota reaches its limit (5h 95%, 7d 98%, Fable 98% by default):
 
 ```bash
 cswap auto                     # foreground loop, polls every 15s
-cswap auto --strategy lowest   # prefer fresh 5h capacity, discount weekly usage
-cswap auto --strategy lowest-fable # include weighted Fable pressure
+cswap auto --five-hour-threshold 95
+cswap auto --seven-day-threshold 98 --fable-threshold 98
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto start               # detach a background worker
@@ -96,10 +96,10 @@ cswap auto stop                # stop the background worker
 <summary>How it behaves & advanced usage</summary>
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
-- A cooldown (default 5 min) and a hysteresis margin stop older headroom strategies from flip-flopping near the threshold; `lowest` and `lowest-fable` use weighted pressure plus the rebalance guard instead. When every account is exhausted it sleeps until the earliest reset.
+- Threshold handoffs are immediate. An account is eligible only while every reported quota is below its own limit; when every alternate is blocked, the worker sleeps until the earliest account can become eligible.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, exhausted ones left alone until they reset — so API traffic stays flat no matter how many accounts you manage.
 - `cswap auto start` sets `autoswitch.enabled=true`, launches a detached worker, and writes `autoswitch_background.log` beside your settings. `cswap auto stop` flips it back to false and stops the worker. `cswap config set autoswitch.enabled true|false` does the same thing. Installing the tool never starts it by itself.
-- Set `autoswitch.rebalance=true` if you want the worker to switch early to a meaningfully better account instead of waiting for the threshold. With `lowest` and `lowest-fable`, 5h usage counts directly, 7d usage only starts to hurt near the weekly ceiling, and Fable is treated as fresh until about 60%. Early rebalances require `autoswitch.rebalanceMinImprovementPct` points of improvement and wait `autoswitch.rebalanceCooldownSeconds` between moves.
+- Configure independent limits with `autoswitch.fiveHourThreshold`, `autoswitch.sevenDayThreshold`, and `autoswitch.fableThreshold`. The old `autoswitch.threshold`, `--threshold`, and automatic `--strategy` values are accepted as deprecated compatibility aliases.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you log in with it and re-run `cswap add --slot N`. API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 
@@ -109,7 +109,7 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
-Defaults like the threshold, cooldown, strategy, background enabled flag, and rebalance policy are configurable with `cswap config set autoswitch.threshold 95`, `cswap config set autoswitch.strategy lowest-fable`, and `cswap config set autoswitch.rebalance true` — flags override them (see [Configuration](#configuration)).
+The three automatic limits and background flag are configurable with `cswap config set autoswitch.fiveHourThreshold 95`, `cswap config set autoswitch.sevenDayThreshold 98`, and `cswap config set autoswitch.fableThreshold 98` (see [Configuration](#configuration)).
 
 </details>
 
@@ -185,7 +185,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`), auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset), and background worker files (`autoswitch_background.pid` / `autoswitch_background.log`) live in the backup directory root.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`), auto-switch state (`autoswitch_state.json` — quarantined accounts and switch metadata; delete it to reset), and background worker files (`autoswitch_background.pid` / `autoswitch_background.log`) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
@@ -216,15 +216,13 @@ Tool preferences live in `settings.json` in the backup root; `cswap config` read
 
 ```bash
 cswap config                              # list effective settings ("(default)" = not set)
-cswap config get autoswitch.threshold
+cswap config get autoswitch.fiveHourThreshold
 cswap config set autoswitch.enabled true  # same as: cswap auto start
-cswap config set autoswitch.threshold 95  # validated: rejects out-of-range values loudly
+cswap config set autoswitch.fiveHourThreshold 95
+cswap config set autoswitch.sevenDayThreshold 98
+cswap config set autoswitch.fableThreshold 98
 cswap config set autoswitch.intervalSeconds 15
-cswap config set autoswitch.strategy lowest-fable
-cswap config set autoswitch.rebalance true
-cswap config set autoswitch.rebalanceMinImprovementPct 20
-cswap config set autoswitch.rebalanceCooldownSeconds 600
-cswap config unset autoswitch.threshold   # back to the default
+cswap config unset autoswitch.fableThreshold   # back to the default
 cswap config path                         # where settings.json lives
 ```
 

@@ -7,23 +7,18 @@ typed events handed to an ``on_event`` callback; the CLI renders them as
 human lines or JSONL, and any future frontend (TUI dashboard, menubar) can
 consume the same stream.
 
-Policy in one paragraph: when the active account's *binding window* (the
-higher of its 5h/7d utilization) crosses ``settings.threshold``, switch to
-the candidate with the most headroom — proactively, so the old account is
-still valid while a running Claude Code picks the new one up (this is what
-makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
-``hysteresis_pct`` below the threshold so two accounts hovering at the line
-never ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate
-(bypassed only when the active account is hard at its limit). Before
-activation the target's token is *freshened* (refreshed if it expires within
-10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
-under-lock re-read sees a fresh token and aborts its own refresh); a target
-whose refresh token is dead gets quarantined instead of activated. When the
-active account's own usage becomes unreadable for ``unhealthy_ticks``
-consecutive ticks, the engine fails over to any healthy candidate.
+Policy in one paragraph: when any active 5h/7d/Fable window reaches its
+configured limit (95%/98%/98% by default), switch immediately to an eligible
+candidate. Fable-capable candidates are ordered by their Fable reset, then
+accounts without Fable by weekly/5h reset; candidates with unknown reset times
+are retained as a last resort. Before activation the target's token is
+*freshened* (refreshed if it expires within 10 minutes); a target whose refresh
+token is dead gets quarantined instead of activated. When the active account's
+own usage becomes unreadable for ``unhealthy_ticks`` consecutive ticks, the
+engine fails over using the same reset-first ordering.
 
-Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
-(so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
+Quarantine state persists in ``<backup_root>/autoswitch_state.json`` (so
+cron-driven ``cswap auto --once`` ticks behave across processes), mutated
 read-modify-write under a dedicated file lock.
 """
 
@@ -135,6 +130,7 @@ class PollEvent(AutoSwitchEvent):
     active: dict | None  # account_ref shape, or None
     headroom: dict[str, float | None]  # account number → headroom pct (None=unknown)
     threshold: float
+    limits: dict[str, float] = field(default_factory=dict)
     # account number → last fetch-error cause ("http-429", "timeout", ...) for
     # accounts whose usage is unknown this tick. Additive field.
     fetch_errors: dict[str, str] = field(default_factory=dict)
@@ -145,6 +141,8 @@ class PollEvent(AutoSwitchEvent):
             "headroomPct": self.headroom,
             "threshold": self.threshold,
         }
+        if self.limits:
+            fields["limits"] = self.limits
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
         return fields
@@ -172,9 +170,15 @@ class PollEvent(AutoSwitchEvent):
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
+        if self.limits:
+            limit_text = ", ".join(
+                f"{name} {value:.0f}%" for name, value in self.limits.items()
+            )
+        else:
+            limit_text = f"{self.threshold:.0f}%"
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {self.threshold:.0f}%){tail}"
+            f"(switch at {limit_text}){tail}"
         )
 
 
@@ -365,6 +369,130 @@ def _fable_pct(usage: dict | None) -> float | None:
     return None if headroom is None else 100.0 - headroom
 
 
+def _fable_window(usage: dict | None) -> dict | None:
+    """Return the reported Fable scoped window, if one exists."""
+    if not isinstance(usage, dict):
+        return None
+    scoped = usage.get("scoped")
+    if not isinstance(scoped, list):
+        return None
+    for entry in scoped:
+        if isinstance(entry, dict) and str(entry.get("name", "")).lower() == "fable":
+            return entry
+    return None
+
+
+def _effective_thresholds(settings: AutoSwitchSettings) -> dict[str, float]:
+    """Return the reset-first limit for each supported quota window.
+
+    ``threshold`` is retained for compatibility display/configuration, while
+    ``five_hour_threshold`` is the canonical value after settings/CLI merging.
+    """
+    return {
+        "five_hour": float(settings.five_hour_threshold),
+        "seven_day": float(settings.seven_day_threshold),
+        "fable": float(settings.fable_threshold),
+    }
+
+
+def _policy_windows(usage: dict | None) -> list[tuple[str, dict]]:
+    """Windows participating in reset-first availability checks."""
+    if not isinstance(usage, dict):
+        return []
+    windows: list[tuple[str, dict]] = []
+    for key in ("five_hour", "seven_day"):
+        value = usage.get(key)
+        if isinstance(value, dict):
+            windows.append((key, value))
+    fable = _fable_window(usage)
+    if fable is not None:
+        windows.append(("fable", fable))
+    return windows
+
+
+def policy_headroom(usage: dict | None, settings: AutoSwitchSettings) -> float | None:
+    """Distance, in percentage points, to the nearest reset-first limit."""
+    thresholds = _effective_thresholds(settings)
+    windows = _policy_windows(usage)
+    values: list[float] = []
+    for key, window in windows:
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)):
+            return None
+        values.append(thresholds[key] - float(pct))
+    # 5h and 7d are the account's required quota data.  An absent Fable window
+    # is normal for accounts/plans that do not expose the scoped limit.
+    if not any(key == "five_hour" for key, _ in windows):
+        return None
+    if not any(key == "seven_day" for key, _ in windows):
+        return None
+    return min(values) if values else None
+
+
+def policy_threshold_reached(usage: dict | None, settings: AutoSwitchSettings) -> bool:
+    """Whether any reported quota window has reached its configured limit."""
+    headroom = policy_headroom(usage, settings)
+    return headroom is not None and headroom <= 0
+
+
+def _policy_candidate_key(
+    usage: dict | None,
+    settings: AutoSwitchSettings,
+    now: float,
+    number: str,
+) -> tuple[int, int, float, int] | None:
+    """Sort key for an eligible automatic target.
+
+    Known-reset Fable accounts always precede known-reset non-Fable accounts.
+    A candidate with an unknown reset is still usable, but is placed after all
+    candidates with complete timestamps.  Sequence order is the final tie
+    breaker and is supplied by the caller's account list.
+    """
+    headroom = policy_headroom(usage, settings)
+    if headroom is None or headroom <= 0:
+        return None
+    windows = _policy_windows(usage)
+    fable_present = any(key == "fable" for key, _ in windows)
+    reset_values: dict[str, float | None] = {
+        key: _window_reset_ts(window) if _window_reset_ts(window) is not None else None
+        for key, window in windows
+    }
+    # Any reported window without a valid future reset is an unknown-reset
+    # candidate.  It remains eligible, but is deliberately ranked last.
+    known = all(ts is not None and ts > now for ts in reset_values.values())
+    if fable_present:
+        primary = reset_values.get("fable")
+    else:
+        primary = reset_values.get("seven_day") or reset_values.get("five_hour")
+    if not known or primary is None:
+        return (1, 1, float("inf"), int(number))
+    return (
+        0,
+        0 if fable_present else 1,
+        float(primary),
+        int(number),
+    )
+
+
+def _blocking_reset_ts(
+    usage: dict | None, settings: AutoSwitchSettings, now: float
+) -> float | None:
+    """When an ineligible account can become eligible again."""
+    if not isinstance(usage, dict):
+        return None
+    thresholds = _effective_thresholds(settings)
+    blockers: list[float] = []
+    for key, window in _policy_windows(usage):
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)) or float(pct) < thresholds[key]:
+            continue
+        ts = _window_reset_ts(window)
+        if ts is None or ts <= now:
+            return None
+        blockers.append(ts)
+    return max(blockers) if blockers else None
+
+
 def _long_window_penalty(pct: float | None) -> float | None:
     """Penalty for slow quota windows that should not dominate until high."""
     if pct is None:
@@ -449,10 +577,7 @@ def _earliest_future_reset_ts(usage: dict | None, now: float) -> float | None:
     if not isinstance(usage, dict):
         return None
     earliest: float | None = None
-    for key in ("five_hour", "seven_day"):
-        window = usage.get(key)
-        if not isinstance(window, dict):
-            continue
+    for _key, window in _policy_windows(usage):
         ts = _window_reset_ts(window)
         if ts is not None and ts > now and (earliest is None or ts < earliest):
             earliest = ts
@@ -670,8 +795,14 @@ class AutoSwitchEngine:
 
         current = self.switcher.current_account_number()
         if current is None:
+            limits = _effective_thresholds(settings)
             self._emit(
-                PollEvent(active=None, headroom={}, threshold=settings.threshold)
+                PollEvent(
+                    active=None,
+                    headroom={},
+                    threshold=limits["five_hour"],
+                    limits={"5h": limits["five_hour"], "7d": limits["seven_day"], "Fable": limits["fable"]},
+                )
             )
             if self.switcher.has_live_login():
                 # Live login exists but cswap doesn't manage it: never act —
@@ -698,11 +829,13 @@ class AutoSwitchEngine:
         }
 
         entries, usage, headroom = self._collect_scheduled_usage(current, quarantined)
+        limits = _effective_thresholds(settings)
         self._emit(
             PollEvent(
                 active=active_ref,
                 headroom=headroom,
-                threshold=settings.threshold,
+                threshold=limits["five_hour"],
+                limits={"5h": limits["five_hour"], "7d": limits["seven_day"], "Fable": limits["fable"]},
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -724,26 +857,29 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_value = usage.get(current)
-        active_headroom = strategy_headroom(
+        active_policy_headroom = policy_headroom(
             active_value if isinstance(active_value, dict) else None,
-            settings.strategy,
+            settings,
         )
-        if active_headroom is not None:
+        if active_policy_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
-            utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
-                if not settings.rebalance:
-                    self._emit(
-                        NoSwitchEvent(
-                            reason="below-threshold",
-                            detail=f"{utilization:.0f}% < {settings.threshold:.0f}%",
-                        )
+            if active_policy_headroom > 0:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="below-threshold",
+                        detail=(
+                            "all reported windows remain below their limits "
+                            f"(5h {_effective_thresholds(settings)['five_hour']:.0f}%, "
+                            f"7d {_effective_thresholds(settings)['seven_day']:.0f}%, "
+                            f"Fable {_effective_thresholds(settings)['fable']:.0f}%)"
+                        ),
                     )
-                    return TickOutcome.NO_ACTION
-                trigger = "rebalance"
-            else:
-                trigger = "at-limit" if active_headroom <= 0 else "proactive"
+                )
+                return TickOutcome.NO_ACTION
+            # A threshold handoff is immediate; cooldown and hysteresis are
+            # intentionally not consulted by the reset-first policy.
+            trigger = "at-limit" if active_policy_headroom <= 0 else "proactive"
         else:
             if active_value == USAGE_TOKEN_EXPIRED:
                 # Expired while an owner (Claude Code / live session) holds the
@@ -792,13 +928,6 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger == "proactive" and self._in_cooldown(state):
-            self._emit(NoSwitchEvent(reason="cooldown"))
-            return TickOutcome.NO_ACTION
-        if trigger == "rebalance" and self._in_rebalance_cooldown(state):
-            self._emit(NoSwitchEvent(reason="rebalance-cooldown"))
-            return TickOutcome.NO_ACTION
-
         # -- candidate selection ------------------------------------------
         candidates = [
             num
@@ -820,79 +949,31 @@ class AutoSwitchEngine:
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
-        hysteresis_bar = settings.threshold - settings.hysteresis_pct
-        qualifying: list[tuple[tuple[float, ...], str]] = []
+        now = self.clock()
+        qualifying: list[tuple[tuple[int, int, float, int], str]] = []
         any_known = False
         any_strategy_known = False
-        lowest_strategy = settings.strategy in ("lowest", "lowest-fable")
-        active_score = strategy_score(
-            active_value if isinstance(active_value, dict) else None,
-            settings.strategy,
-        )
         for num in oauth_candidates:
-            h = headroom.get(num)
-            if h is None:
+            value = usage.get(num)
+            if not isinstance(value, dict):
                 continue
             any_known = True
-            value = usage.get(num)
-            score = strategy_score(
-                value if isinstance(value, dict) else None,
-                settings.strategy,
-            )
-            if score is None:
-                continue
             any_strategy_known = True
-            if h <= 0:
-                continue  # itself at its limit — never a target
-            if settings.strategy == "lowest-fable":
-                fable_h = oauth.scoped_model_headroom(
-                    value if isinstance(value, dict) else None,
-                    FABLE_MODEL_NAME,
-                )
-                if fable_h is None or fable_h <= 0:
-                    continue
-            if trigger in ("proactive", "rebalance") and not lowest_strategy:
-                # Hysteresis guards optional moves: two accounts hovering at
-                # the line must not ping-pong. At-limit and failover are
-                # escapes - any account with real headroom beats a blocked or
-                # dead one (and you can't flap back onto an account at 100%).
-                if (100.0 - h) > hysteresis_bar:
-                    continue
-            if trigger == "proactive":
-                if lowest_strategy:
-                    if active_score is not None and score <= active_score:
-                        continue  # not provably better than where we are
-                elif active_headroom is not None and h <= active_headroom:
-                    continue  # not provably better than where we are
-            elif trigger == "rebalance":
-                if active_score is None:
-                    continue
-                if (
-                    score[0] - active_score[0]
-                    < settings.rebalance_min_improvement_pct
-                ):
-                    continue
-            qualifying.append((score, num))
-        # Best strategy score first; list order (sequence order) breaks ties.
-        qualifying.sort(key=lambda t: tuple(-part for part in t[0]))
+            score = _policy_candidate_key(value, settings, now, num)
+            if score is not None:
+                qualifying.append((score, num))
+        # Reset-first ordering is already ascending; sequence order is encoded
+        # as the final key component for deterministic ties.
+        qualifying.sort(key=lambda t: t[0])
         ordered = [num for _, num in qualifying]
-        if not ordered and api_key_candidates and trigger != "rebalance":
+        if not ordered and api_key_candidates:
             # Last resort: metered API-key accounts (unmeasurable headroom).
             ordered = api_key_candidates
 
         if not ordered:
-            if trigger == "rebalance":
-                detail = (
-                    f"no target improves by "
-                    f"{settings.rebalance_min_improvement_pct:.0f} pct"
-                )
-                self._emit(NoSwitchEvent(reason="below-threshold", detail=detail))
-                return TickOutcome.NO_ACTION
             if not any_known or not any_strategy_known:
                 detail = (
-                    "no candidate has readable Fable usage"
-                    if settings.strategy in ("fable-best", "lowest-fable")
-                    else "no candidate has readable usage"
+                    "no candidate has readable usage"
                 )
                 self._emit(
                     NoSwitchEvent(
@@ -901,37 +982,36 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.BLOCKED
-            # "All exhausted" (and its hours-long reset sleep) only when it's
-            # literally true: every candidate's usage is known and at its
-            # limit. A candidate that merely failed the proactive hysteresis
-            # bar, or one whose usage is unreadable this tick, can become
-            # viable at any moment — and the active account can hit 100% and
-            # need the at-limit escape — so those keep the normal cadence.
-            candidate_headrooms = [headroom.get(n) for n in oauth_candidates]
-            truly_exhausted = all(
-                h is not None and h <= 0 for h in candidate_headrooms
+            # Sleep only when every readable candidate is blocked by one or
+            # more quota windows.  A candidate with unreadable usage remains
+            # on the normal retry cadence so failover is not delayed.
+            blocking_resets = [
+                _blocking_reset_ts(usage.get(n), settings, now)
+                for n in oauth_candidates
+            ]
+            truly_exhausted = bool(blocking_resets) and all(
+                value is not None for value in blocking_resets
             )
             if not truly_exhausted:
                 self._emit(
                     NoSwitchEvent(
                         reason="no-qualifying-candidate",
                         detail=(
-                            "candidates are too close to the line or their "
+                            "candidates are at a configured limit or their "
                             "usage is unreadable this tick"
                         ),
                     )
                 )
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
-            earliest = self._earliest_reset(usage)
-            if earliest is not None:
-                self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
+            earliest_ts = min(value for value in blocking_resets if value is not None)
+            self._sleep_until_ts = earliest_ts + RESET_SLACK_S
             self._emit(
                 AllExhaustedEvent(
                     earliest_reset_at=(
-                        earliest.isoformat().replace("+00:00", "Z")
-                        if earliest
-                        else None
+                        datetime.fromtimestamp(
+                            earliest_ts, tz=timezone.utc
+                        ).isoformat().replace("+00:00", "Z")
                     )
                 )
             )
@@ -1020,16 +1100,15 @@ class AutoSwitchEngine:
         usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         active_value = usage.get(current)
-        active_headroom = strategy_headroom(
+        active_headroom = policy_headroom(
             active_value if isinstance(active_value, dict) else None,
-            self.settings.strategy,
+            self.settings,
         )
         escalate = bool(candidates) and (
             (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
             or (
                 active_headroom is not None
-                and 100.0 - active_headroom
-                >= self.settings.threshold - ESCALATION_MARGIN_PCT
+                and active_headroom <= ESCALATION_MARGIN_PCT
             )
         )
         if escalate:
@@ -1054,11 +1133,10 @@ class AutoSwitchEngine:
         the common source of sustained usage-endpoint 429s.
         """
         interval = float(self.settings.interval_seconds)
-        pct = binding_pct(entry.last_good, self.settings.strategy)
-        if pct is None:
+        distance = policy_headroom(entry.last_good, self.settings)
+        if distance is None:
             return interval
-        band_edge = self.settings.threshold - ESCALATION_MARGIN_PCT
-        if pct >= band_edge:
+        if distance <= ESCALATION_MARGIN_PCT:
             return interval
         return ACTIVE_MAX_INTERVAL_S
 
@@ -1086,18 +1164,18 @@ class AutoSwitchEngine:
             if after.fetched_at is None or after.fetched_at == before.fetched_at:
                 continue  # not fetched this pass
             base = before.poll_interval_s or self.settings.interval_seconds
-            prev_pct = binding_pct(before.last_good, self.settings.strategy)
-            new_pct = binding_pct(after.last_good, self.settings.strategy)
-            if prev_pct is None or new_pct is None:
+            prev_distance = policy_headroom(before.last_good, self.settings)
+            new_distance = policy_headroom(after.last_good, self.settings)
+            if prev_distance is None or new_distance is None:
                 interval = self.settings.interval_seconds
-            elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
+            elif abs(new_distance - prev_distance) >= MOVEMENT_DELTA_PCT:
                 interval = max(self.settings.interval_seconds, base / 2)
             else:
                 interval = min(CANDIDATE_MAX_INTERVAL_S, base * 1.5)
             next_poll = now + interval
-            headroom = oauth.account_headroom(after.last_good)
-            if headroom is not None and headroom <= 0:
-                reset_ts = _limiting_reset_ts(after.last_good)
+            distance = policy_headroom(after.last_good, self.settings)
+            if distance is not None and distance <= 0:
+                reset_ts = _blocking_reset_ts(after.last_good, self.settings, now)
                 if reset_ts is not None and reset_ts > next_poll:
                     next_poll = reset_ts
             else:
@@ -1192,6 +1270,16 @@ class AutoSwitchEngine:
                 except ValueError:
                     continue
                 if earliest is None or when < earliest:
+                    earliest = when
+            fable = _fable_window(entry)
+            if fable and fable.get("resets_at"):
+                try:
+                    when = datetime.fromisoformat(
+                        str(fable["resets_at"]).replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    when = None
+                if when is not None and (earliest is None or when < earliest):
                     earliest = when
         return earliest
 

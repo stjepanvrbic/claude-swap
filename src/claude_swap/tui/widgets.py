@@ -128,7 +128,7 @@ def account_card_text(
     acc: AccountSnapshot,
     width: int,
     *,
-    threshold: float | None = None,
+    threshold: float | dict[str, float] | None = None,
     now: float | None = None,
 ) -> Text:
     """The full account card: header line + per-window bar rows."""
@@ -180,6 +180,11 @@ def account_card_text(
     bar_width = max(12, min(30, width - 42 - label_width))
     for label, pct, suffix in rows:
         text.append("\n    ")
+        threshold_value = threshold
+        if isinstance(threshold, dict):
+            threshold_value = threshold.get(label.lower())
+            if threshold_value is None and label.lower().startswith("fable"):
+                threshold_value = threshold.get("fable")
         text.append(
             usage_bar(
                 f"{label:<{label_width}}",
@@ -187,7 +192,7 @@ def account_card_text(
                 suffix or None,
                 bar_width,
                 stale=stale,
-                threshold=threshold,
+                threshold=threshold_value,
             )
         )
     return text
@@ -287,7 +292,7 @@ class AccountsPanel(Static):
             if acc.is_active:
                 blocks.append(
                     account_card_text(
-                        acc, width, threshold=app.threshold_pct, now=now
+                        acc, width, threshold=app.thresholds, now=now
                     )
                 )
             elif self._show_minis:

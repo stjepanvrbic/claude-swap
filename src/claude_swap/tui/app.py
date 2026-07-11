@@ -54,14 +54,18 @@ class CswapApp(App):
         self._full_next = False
         self._refreshing = False
         self._last_refresh_error = ""
-        # The auto-switch threshold, drawn as a tick on the status strip's
-        # bars everywhere. Missing/invalid settings fall back to the default.
+        # Auto-switch limits, drawn as ticks on the corresponding usage bars.
         try:
-            self.threshold_pct: float | None = load_settings(
-                switcher.backup_dir
-            ).threshold
+            settings = load_settings(switcher.backup_dir)
+            self.thresholds = {
+                "5h": settings.five_hour_threshold,
+                "7d": settings.seven_day_threshold,
+                "fable": settings.fable_threshold,
+            }
         except Exception:
-            self.threshold_pct = None
+            self.thresholds = {"5h": 95.0, "7d": 98.0, "fable": 98.0}
+        # Kept for third-party widgets that read the old single value.
+        self.threshold_pct = self.thresholds["5h"]
 
     def on_mount(self) -> None:
         self.register_theme(CSWAP_DARK)
