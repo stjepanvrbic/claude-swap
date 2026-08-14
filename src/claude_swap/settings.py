@@ -43,6 +43,7 @@ class AutoSwitchSettings:
     """
 
     enabled: bool = False
+    paused: bool = False
     threshold: float = 95.0
     five_hour_threshold: float = 95.0
     seven_day_threshold: float = 98.0
@@ -93,6 +94,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "enabled", "enabled", "bool",
             help="Keep the detached background auto-switch worker running",
+        ),
+        SettingSpec(
+            "autoswitch", "paused", "paused", "bool",
+            help="Temporarily stop automatic account switching",
         ),
         SettingSpec(
             "autoswitch", "threshold", "threshold", "float", 50.0, 99.9,

@@ -197,7 +197,9 @@ def _auto_command(argv: list[str]) -> None:
     if argv and argv[0] == "_worker":
         _auto_worker_command(argv[1:])
         return
-    if argv and argv[0] in {"start", "stop", "restart", "status", "enable", "disable"}:
+    if argv and argv[0] in {
+        "start", "stop", "restart", "status", "enable", "disable", "pause", "resume"
+    }:
         _auto_background_command(argv)
         return
 
@@ -225,7 +227,8 @@ Examples:
   cswap auto --dry-run             # log decisions, never actually switch
   cswap auto start                 # run the auto-switcher in the background
   cswap auto stop                  # stop the background auto-switcher
-
+  cswap auto pause                 # stop switching while you re-login an account
+  cswap auto resume                # resume switching after account changes
 Defaults live in settings.json in the backup root; flags override them.
         """,
     )
@@ -376,7 +379,7 @@ Defaults live in settings.json in the backup root; flags override them.
 
 
 def _auto_background_command(argv: list[str]) -> None:
-    """Handle `cswap auto start|stop|restart|status`."""
+    """Handle `cswap auto start|stop|restart|status|pause|resume`."""
     parser = argparse.ArgumentParser(
         prog="cswap auto",
         description="Manage the detached background auto-switch worker.",
@@ -385,12 +388,17 @@ def _auto_background_command(argv: list[str]) -> None:
 Examples:
   cswap auto start
   cswap auto status
+  cswap auto pause
+  cswap auto resume
   cswap auto stop
         """,
     )
     parser.add_argument(
         "action",
-        choices=("start", "stop", "restart", "status", "enable", "disable"),
+        choices=(
+            "start", "stop", "restart", "status", "enable", "disable",
+            "pause", "resume",
+        ),
     )
     parser.add_argument(
         "--json",
@@ -414,7 +422,7 @@ Examples:
                 "background": st.to_json(),
             }, indent=2))
             return
-        state = "running" if st.running else "stopped"
+        state = "paused" if st.paused else ("running" if st.running else "stopped")
         enabled = "enabled" if st.enabled else "disabled"
         pid = f", pid {st.pid}" if st.pid and st.running else ""
         print(f"auto-switch background: {enabled}, {state}{pid}")
@@ -440,6 +448,10 @@ Examples:
         elif action == "restart":
             background.stop(switcher.backup_dir)
             st = background.start(switcher.backup_dir, debug=args.debug)
+        elif action == "pause":
+            st = background.pause(switcher.backup_dir)
+        elif action == "resume":
+            st = background.resume(switcher.backup_dir, debug=args.debug)
         else:
             st = background.status(switcher.backup_dir)
         render(st, action)

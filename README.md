@@ -89,6 +89,8 @@ cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto start               # detach a background worker
 cswap auto status              # show whether the worker is running
+cswap auto pause               # pause switching while re-logging an account
+cswap auto resume              # resume switching after account changes
 cswap auto stop                # stop the background worker
 ```
 
@@ -98,7 +100,7 @@ cswap auto stop                # stop the background worker
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
 - Threshold handoffs are immediate. An account is eligible only while every reported quota is below its own limit; when every alternate is blocked, the worker sleeps until the earliest account can become eligible.
 - Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, exhausted ones left alone until they reset — so API traffic stays flat no matter how many accounts you manage.
-- `cswap auto start` sets `autoswitch.enabled=true`, launches a detached worker, and writes `autoswitch_background.log` beside your settings. `cswap auto stop` flips it back to false and stops the worker. `cswap config set autoswitch.enabled true|false` does the same thing. Installing the tool never starts it by itself.
+- `cswap auto start` sets `autoswitch.enabled=true` and launches a detached worker. Use `cswap auto pause` before logging into Claude and running `cswap add`; it keeps the worker alive but makes every automatic tick a no-op until `cswap auto resume`. `cswap auto stop` flips `autoswitch.enabled` back to false and stops the worker. `cswap config set autoswitch.enabled true|false` does the same thing. Installing the tool never starts it by itself.
 - Configure independent limits with `autoswitch.fiveHourThreshold`, `autoswitch.sevenDayThreshold`, and `autoswitch.fableThreshold`. The old `autoswitch.threshold`, `--threshold`, and automatic `--strategy` values are accepted as deprecated compatibility aliases.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
 - An account whose refresh token has died is quarantined and reported until you log in with it and re-run `cswap add --slot N`. API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
@@ -150,6 +152,8 @@ cswap run 2                     # Run an account in this terminal only (session 
 cswap auto                      # Auto-switch when nearing rate limits (see above)
 cswap auto start                # Start the background auto-switch worker
 cswap auto status               # Show background auto-switch state
+cswap auto pause                # Pause switching while changing an account
+cswap auto resume               # Resume switching after account changes
 cswap auto stop                 # Stop the background auto-switch worker
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times

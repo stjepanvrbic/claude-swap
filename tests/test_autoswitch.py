@@ -174,6 +174,19 @@ class TestDecisionTable:
         reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
         assert reasons == ["below-threshold"]
 
+    def test_paused_tick_does_not_poll(self, temp_home):
+        h = EngineHarness(temp_home, paused=True)
+        h.seed(1, "a@example.com")
+        h.make_live("a@example.com", 1)
+
+        with patch.object(h.switcher, "usage_entries_by_account") as poll:
+            outcome = h.engine.tick()
+
+        assert outcome is TickOutcome.NO_ACTION
+        poll.assert_not_called()
+        event = next(e for e in h.events if isinstance(e, NoSwitchEvent))
+        assert event.reason == "paused"
+
     def test_rebalance_switches_below_threshold_to_better_account(self, temp_home):
         h = EngineHarness(temp_home, rebalance=True)
         h.seed(1, "a@example.com")

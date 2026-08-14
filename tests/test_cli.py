@@ -951,6 +951,26 @@ class TestAutoCommand:
         assert "enabled, running, pid 123" in out
         assert "log" in out
 
+
+    def test_auto_pause_uses_background_manager(self, temp_home, capsys):
+        from claude_swap.background import BackgroundStatus
+
+        status = BackgroundStatus(
+            enabled=True,
+            pid=123,
+            running=True,
+            pid_path=Path("pid"),
+            log_path=Path("log"),
+            paused=True,
+        )
+        with patch("claude_swap.background.pause", return_value=status) as pause, \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "pause"]):
+            cli.main()
+
+        pause.assert_called_once()
+        assert "paused" in capsys.readouterr().out
+
     def test_auto_status_json(self, temp_home, capsys):
         from claude_swap.background import BackgroundStatus
 

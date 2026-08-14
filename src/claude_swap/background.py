@@ -23,10 +23,12 @@ class BackgroundStatus:
     running: bool
     pid_path: Path
     log_path: Path
+    paused: bool = False
 
     def to_json(self) -> dict:
         return {
             "enabled": self.enabled,
+            "paused": self.paused,
             "pid": self.pid,
             "running": self.running,
             "pidPath": str(self.pid_path),
@@ -99,9 +101,11 @@ def _process_running(pid: int | None) -> bool:
 
 def status(backup_root: Path) -> BackgroundStatus:
     path = pid_path(backup_root)
+    settings = load_settings(backup_root)
     pid = _read_pid(path)
     return BackgroundStatus(
-        enabled=load_settings(backup_root).enabled,
+        enabled=settings.enabled,
+        paused=settings.paused,
         pid=pid,
         running=_process_running(pid),
         pid_path=path,
@@ -174,4 +178,19 @@ def stop(
             _remove_pid(current.pid_path)
             return status(backup_root)
         time.sleep(0.1)
+    return status(backup_root)
+
+
+def pause(backup_root: Path) -> BackgroundStatus:
+    """Pause switching without stopping a process manager's worker."""
+    set_setting(backup_root, "autoswitch.paused", "true")
+    return status(backup_root)
+
+
+def resume(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
+    """Resume switching and restore a previously enabled worker."""
+    was_enabled = load_settings(backup_root).enabled
+    set_setting(backup_root, "autoswitch.paused", "false")
+    if was_enabled:
+        return start(backup_root, debug=debug)
     return status(backup_root)

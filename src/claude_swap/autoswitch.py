@@ -782,6 +782,14 @@ class AutoSwitchEngine:
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
+        if settings.paused:
+            self._emit(
+                NoSwitchEvent(
+                    reason="paused",
+                    detail="resume with 'cswap auto resume'",
+                )
+            )
+            return TickOutcome.NO_ACTION
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are

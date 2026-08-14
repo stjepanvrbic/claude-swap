@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from claude_swap import background
-from claude_swap.settings import load_settings
+from claude_swap.settings import load_settings, set_setting
 
 
 def test_status_defaults_to_disabled(tmp_path: Path):
@@ -44,3 +44,35 @@ def test_stop_disables_and_removes_dead_pid(tmp_path: Path):
     assert st.running is False
     assert not (tmp_path / background.PID_FILENAME).exists()
 
+
+def test_pause_preserves_enabled_worker_state(tmp_path: Path):
+    set_setting(tmp_path, "autoswitch.enabled", "true")
+    (tmp_path / background.PID_FILENAME).write_text("12345\n")
+
+    with patch("claude_swap.background._process_running", return_value=True):
+        st = background.pause(tmp_path)
+
+    settings = load_settings(tmp_path)
+    assert settings.enabled is True
+    assert settings.paused is True
+    assert st.running is True
+
+
+def test_resume_restarts_enabled_worker(tmp_path: Path):
+    set_setting(tmp_path, "autoswitch.enabled", "true")
+    set_setting(tmp_path, "autoswitch.paused", "true")
+    status = background.BackgroundStatus(
+        enabled=True,
+        pid=12345,
+        running=True,
+        pid_path=tmp_path / background.PID_FILENAME,
+        log_path=tmp_path / background.LOG_FILENAME,
+        paused=False,
+    )
+
+    with patch("claude_swap.background.start", return_value=status) as start:
+        st = background.resume(tmp_path)
+
+    start.assert_called_once_with(tmp_path, debug=False)
+    assert st is status
+    assert load_settings(tmp_path).paused is False
