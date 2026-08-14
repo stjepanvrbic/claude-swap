@@ -11,6 +11,7 @@ import pytest
 
 from claude_swap import cli
 from claude_swap.background import BackgroundStatus
+from claude_swap.settings import SETTING_SPECS
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -42,19 +43,24 @@ class TestConfigList:
         assert code == 0
         for key in (
             "autoswitch.enabled",
+            "autoswitch.paused",
             "autoswitch.threshold",
+            "autoswitch.fiveHourThreshold",
+            "autoswitch.sevenDayThreshold",
+            "autoswitch.fableThreshold",
             "autoswitch.intervalSeconds",
             "autoswitch.cooldownSeconds",
             "autoswitch.hysteresisPct",
             "autoswitch.strategy",
-            "autoswitch.rebalance",
-            "autoswitch.rebalanceMinImprovementPct",
-            "autoswitch.rebalanceCooldownSeconds",
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
+            "autoswitch.model",
+            "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 11
+        # One "(default)" per spec: the count follows SETTING_SPECS instead of
+        # a literal, so adding a key does not need a test edit.
+        assert out.count("(default)") == len(SETTING_SPECS)
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -81,13 +87,14 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 11
+        assert len(by_key) == len(SETTING_SPECS)
         assert by_key["autoswitch.enabled"]["value"] is False
         assert by_key["autoswitch.threshold"]["value"] == 95.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
-        assert by_key["autoswitch.rebalance"]["value"] is False
-        assert by_key["autoswitch.rebalanceMinImprovementPct"]["value"] == 20.0
-        assert by_key["autoswitch.rebalanceCooldownSeconds"]["value"] == 600.0
+        assert by_key["autoswitch.paused"]["value"] is False
+        assert by_key["autoswitch.fiveHourThreshold"]["value"] == 95.0
+        assert by_key["autoswitch.sevenDayThreshold"]["value"] == 98.0
+        assert by_key["autoswitch.fableThreshold"]["value"] == 98.0
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
 
 
@@ -209,13 +216,12 @@ class TestConfigValidation:
         assert code == 1
         assert "expects an integer" in err
 
-    def test_bad_strategy_exits_1(self, temp_home, capsys):
-        code, _, err = _run(["set", "autoswitch.strategy", "chaos"], capsys)
-        assert code == 1
-        assert "must be one of: best, fable-best, lowest, lowest-fable" in err
-
-    @pytest.mark.parametrize("strategy", ["fable-best", "lowest", "lowest-fable"])
-    def test_extra_strategies_are_accepted(self, temp_home, capsys, strategy):
+    @pytest.mark.parametrize(
+        "strategy", ["chaos", "consume-first", "fable-best", "lowest", "lowest-fable"]
+    )
+    def test_strategy_values_are_accepted_for_compatibility(
+        self, temp_home, capsys, strategy
+    ):
         code, out, err = _run(["set", "autoswitch.strategy", strategy], capsys)
         assert code == 0
         assert err == ""

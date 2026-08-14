@@ -16,13 +16,18 @@ unit-tested in CI; ``rumps`` is imported lazily inside the app glue.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import plistlib
 import re
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
+from claude_swap import pace
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.switcher import SENTINEL_NOTES
 
@@ -31,6 +36,50 @@ REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
+NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
+
+
+def ensure_notification_identity(
+    executable: Path | None = None,
+    *,
+    platform: str = sys.platform,
+) -> Path | None:
+    """Ensure rumps can resolve a bundle identifier for notifications.
+
+    Command-line Python tools have no app bundle, so rumps looks for an
+    ``Info.plist`` beside the interpreter. uv/pipx reinstalls can recreate that
+    environment; repair the tiny plist on every launch when needed.
+    """
+    if platform != "darwin":
+        return None
+    path = (executable or Path(sys.executable)).parent / "Info.plist"
+    data: dict = {}
+    try:
+        if path.exists():
+            try:
+                loaded = plistlib.loads(path.read_bytes())
+            except Exception:
+                loaded = None  # unreadable/corrupt — rebuild from scratch
+            if isinstance(loaded, dict):
+                data = loaded
+        changed = False
+        if not data.get("CFBundleIdentifier"):
+            data["CFBundleIdentifier"] = NOTIFICATION_BUNDLE_ID
+            changed = True
+        if not data.get("CFBundleName"):
+            data["CFBundleName"] = "claude-swap"
+            changed = True
+        if changed or not path.exists():
+            # atomic: an interrupted write must not leave a half-written plist
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_bytes(plistlib.dumps(data))
+            os.replace(tmp, path)
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        logging.getLogger("claude-swap").warning(
+            "Could not prepare menu-bar notification identity: %s", exc
+        )
+        return None
+    return path
 
 
 @dataclass
@@ -45,6 +94,7 @@ class MenuBarSettings:
 
     show_account_name: bool = True
     title_pct: str = "both"  # one of TITLE_PCT_CHOICES
+    title_scoped: bool = False  # append per-model weekly limits (e.g. Fable) to the title
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
 
@@ -139,8 +189,44 @@ def _live_countdown(window: dict | str | None, now: float) -> str | None:
     return f"{minutes}m"
 
 
-def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
-    """One-line usage summary for an account row (reset countdown computed live)."""
+_WEEKLY_PERIOD_S = 7 * 86400  # weekly limits reset on a fixed 7-day cadence
+
+
+def _rolled_weekly_window(window: dict | None, now: float) -> dict | None:
+    """A weekly window with a passed reset advanced to its next 7-day boundary.
+
+    Weekly limits reset on a fixed weekly cadence, so once the stored
+    ``resets_at`` is in the past we know the window rolled over — the stored pct
+    belongs to a window that no longer exists. Return a copy reflecting the reset
+    state (``pct`` 0, ``resets_at`` advanced to the next future boundary) so the
+    menu bar shows the reset from the static schedule alone, without waiting to
+    spend tokens on a fresh fetch. Missing/future/unparseable windows are
+    returned unchanged.
+    """
+    if not isinstance(window, dict):
+        return window
+    ts = _resets_at_ts(window)
+    if ts == float("inf") or ts > now:
+        return window
+    missed = int((now - ts) // _WEEKLY_PERIOD_S) + 1
+    new_ts = ts + missed * _WEEKLY_PERIOD_S
+    rolled = dict(window)
+    rolled["pct"] = 0.0
+    rolled["resets_at"] = datetime.fromtimestamp(new_ts, tz=timezone.utc).isoformat()
+    rolled.pop("countdown", None)  # recomputed live from the rolled resets_at
+    rolled.pop("clock", None)
+    return rolled
+
+
+def usage_summary(
+    usage: dict | str | None, now: float | None = None, fetched_at: float | None = None
+) -> str:
+    """One-line usage summary for an account row (reset countdown computed live).
+
+    ``fetched_at`` is the underlying measurement's fetch time (may be older
+    than ``now`` when serving last-good data) — used only to flag a weekly
+    window that's meaningfully ahead of pace (issue #125), never the 5h one.
+    """
     if isinstance(usage, str):
         return usage
     if usage is None:
@@ -150,11 +236,36 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
     parts: list[str] = []
     for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
         window = usage.get(key)
+        pace_result = None
+        if key == "seven_day":
+            window = _rolled_weekly_window(window, now)  # reflect a passed weekly reset
+            # Pace against the rolled window, not the raw one: a stale window
+            # rolled to 0% has no current-cycle data to compare against, so
+            # its (correctly zeroed) pct naturally never reads as "ahead" —
+            # computing pace pre-roll would otherwise pair last cycle's high
+            # pct with this cycle's freshly-reset 0% display.
+            pace_result = pace.compute_pace(window, fetched_at=fetched_at)
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)):
             seg = f"{label} {window['pct']:.0f}%"
+            if key == "seven_day" and pace_result and pace_result.ahead:
+                seg += " (ahead)"
             countdown = _live_countdown(window, now)
             if countdown:
                 seg += f" ({countdown})"  # time until this window resets
+            parts.append(seg)
+    # Per-model weekly limits (e.g. Fable), from the usage API's ``limits`` array.
+    for window in usage.get("scoped") or []:
+        window = _rolled_weekly_window(window, now)  # weekly cadence, same roll-forward
+        pace_result = pace.compute_pace(window, fetched_at=fetched_at)  # against the rolled window, see above
+        if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
+            seg = f"{window['name']} {window['pct']:.0f}%"
+            if window["pct"] >= 100:
+                seg += " (!)"  # maxed model — the usual reason to switch
+            elif pace_result and pace_result.ahead:
+                seg += " (ahead)"
+            countdown = _live_countdown(window, now)
+            if countdown:
+                seg += f" ({countdown})"
             parts.append(seg)
     spend = usage.get("spend")
     if isinstance(spend, dict) and isinstance(spend.get("pct"), (int, float)):
@@ -163,10 +274,18 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
 
 
 def format_account_label(
-    num, email: str, usage: dict | str | None, now: float | None = None
+    num,
+    email: str,
+    usage: dict | str | None,
+    now: float | None = None,
+    alias: str | None = None,
+    disabled: bool = False,
+    fetched_at: float | None = None,
 ) -> str:
     """Build one account row's menu label."""
-    return f"{num}  {email}  {usage_summary(usage, now)}"
+    label = f"{alias}  ({email})" if alias else email
+    marker = "  (disabled)" if disabled else ""
+    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -181,21 +300,34 @@ def format_title(
     active_email: str | None,
     active_usage: dict | str | None,
     settings: MenuBarSettings,
+    now: float | None = None,
+    alias: str | None = None,
 ) -> str:
     """Build the menu-bar title from the active account and settings."""
     if active_email is None:
         return ICON
+    if now is None:
+        now = time.time()
     segments: list[str] = []
     if settings.show_account_name:
-        segments.append(_local_part(active_email))
+        segments.append(alias if alias else _local_part(active_email))
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
             segments.append(f"{p:.0f}%")
     if settings.title_pct in ("7d", "both"):
-        p = _window_pct(active_usage, "seven_day")
+        seven = active_usage.get("seven_day") if isinstance(active_usage, dict) else None
+        seven = _rolled_weekly_window(seven, now)  # reflect a passed weekly reset
+        p = seven["pct"] if isinstance(seven, dict) and isinstance(seven.get("pct"), (int, float)) else None
         if p is not None:
             segments.append(f"{p:.0f}%")
+    if settings.title_scoped and isinstance(active_usage, dict):
+        # Per-model weekly limits (e.g. Fable), same shape/roll-forward as the
+        # dropdown rows; named so multiple scoped models stay distinguishable.
+        for window in active_usage.get("scoped") or []:
+            window = _rolled_weekly_window(window, now)
+            if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
+                segments.append(f"{window['name']} {window['pct']:.0f}%")
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
@@ -266,38 +398,72 @@ def _account_display_usage(entry) -> dict | str | None:
     return entry.last_good
 
 
-EMPTY_SNAPSHOT: dict = {"accounts": [], "active_email": None, "active_usage": None}
+EMPTY_SNAPSHOT: dict = {
+    "accounts": [],
+    "active_email": None,
+    "active_usage": None,
+    "active_alias": None,
+}
 
 
 def _adapt_snapshot(snap) -> dict:
     """Adapt an ``AccountsSnapshot`` to the menu bar's render dict.
 
-    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good), ...],
-    "active_email": str | None, "active_usage": dict | str | None}``. The snapshot
-    itself is produced by ``SnapshotSource`` (the paced read path), so this is a
-    pure transform — no fetching, no I/O.
+    Shape: ``{"accounts": [(num, email, is_active, display_usage, last_good, alias, disabled, fetched_at), ...],
+    "active_email": str | None, "active_usage": dict | str | None,
+    "active_alias": str | None}``. The snapshot itself is produced by
+    ``SnapshotSource`` (the paced read path), so this is a pure transform — no
+    fetching, no I/O. Per-account ``fetched_at`` is the underlying
+    measurement's fetch time, used only for the pace marker (issue #125).
     """
     accounts = []
     active_email = None
     active_usage = None
+    active_alias = None
     for acc in snap.accounts:
         display = _account_display_usage(acc.usage)
-        accounts.append((acc.number, acc.email, acc.is_active, display, acc.usage.last_good))
+        accounts.append(
+            (
+                acc.number, acc.email, acc.is_active, display, acc.usage.last_good,
+                acc.alias, acc.disabled, acc.usage.fetched_at,
+            )
+        )
         if acc.is_active:
-            active_email, active_usage = acc.email, display
+            active_email, active_usage, active_alias = acc.email, display, acc.alias
     return {
         "accounts": accounts,
         "active_email": active_email,
         "active_usage": active_usage,
+        "active_alias": active_alias,
     }
 
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
-    import rumps  # lazy: optional dependency, imported only when launching
+    ensure_notification_identity()
+    try:
+        import rumps  # lazy: optional dependency, imported only when launching
+        import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
+    except ImportError as e:
+        # This module is import-safe without rumps by design, so the CLI's
+        # guard around ``from claude_swap.menubar import run`` can never see a
+        # missing extra — the failure lands here at call time. Raise the
+        # error type the CLI already renders cleanly instead of a traceback.
+        raise ClaudeSwitchError(
+            "Menu bar mode requires 'rumps'. "
+            "Install with: pip install 'claude-swap[menubar]'"
+        ) from e
+
+    # rumps never sets an activation policy, so under a framework Python the
+    # process launches as a regular app and parks a "Python" icon in the Dock
+    # for as long as the menu bar runs. Accessory keeps the status item and
+    # dialog windows but stays out of the Dock and the Cmd-Tab switcher.
+    AppKit.NSApplication.sharedApplication().setActivationPolicy_(
+        AppKit.NSApplicationActivationPolicyAccessory
+    )
 
     from claude_swap.autoswitch import AutoSwitchEngine
-    from claude_swap.settings import load_settings, set_setting
+    from claude_swap.settings import load_settings, parse_model_names, set_setting
     from claude_swap.snapshot_source import SnapshotSource
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
@@ -373,7 +539,7 @@ def run(switcher) -> int:
             but de-dupes per account on the (5h, 7d) percentages so an idle
             machine doesn't churn the rotating log with identical lines.
             """
-            for num, email, _is_active, _display, last_good in snap["accounts"]:
+            for num, email, _is_active, _display, last_good, _alias, _disabled, _fetched_at in snap["accounts"]:
                 key = _usage_log_key(last_good)
                 if key == (None, None) or self._last_usage_log.get(num) == key:
                     continue
@@ -467,9 +633,14 @@ def run(switcher) -> int:
                     rumps.notification("claude-swap", "Account quarantined", ev.human())
                 elif ev.kind == "all-exhausted":
                     rumps.notification("claude-swap", "All accounts exhausted", ev.human())
+                elif ev.kind == "config-warning":
+                    # e.g. an autoswitch.model name no account reports — the
+                    # engine emits it once per run; dropping it would leave a
+                    # menu-bar user with a silently inert filter.
+                    rumps.notification("claude-swap", "Configuration warning", ev.human())
 
         def _thresholds(self) -> dict[str, int]:
-            """Current reset-first limits from core settings."""
+            """Current automatic handoff limits from core settings."""
             try:
                 settings = load_settings(self.switcher.backup_dir)
                 return {
@@ -480,20 +651,21 @@ def run(switcher) -> int:
             except Exception:
                 return {"5h": 95, "7d": 98, "Fable": 98}
 
-        def _threshold(self) -> int:
-            """Legacy 5h threshold helper retained for integrations."""
-            return self._thresholds()["5h"]
-
         # ---- menu construction -----------------------------------------------
         def rebuild_menu(self):
             self.title = format_title(
-                self.snapshot["active_email"], self.snapshot["active_usage"], self.settings
+                self.snapshot["active_email"],
+                self.snapshot["active_usage"],
+                self.settings,
+                alias=self.snapshot.get("active_alias"),
             )
             self.menu.clear()
             account_items = []
-            for num, email, is_active, display, _last_good in self.snapshot["accounts"]:
+            for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
-                    format_account_label(num, email, display),
+                    format_account_label(
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                    ),
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
@@ -509,6 +681,7 @@ def run(switcher) -> int:
                 rumps.MenuItem("Next available", callback=self._switch("next-available")),
                 None,
                 self._add_menu(rumps),
+                self._disable_menu(rumps),
                 self._remove_menu(rumps),
                 rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
                 self._history_menu(rumps),
@@ -530,8 +703,25 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
-            for num, email, _is_active, _display, _last_good in accounts:
-                menu.add(rumps.MenuItem(f"{num}  {email}", callback=self._make_remove(num)))
+            for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
+                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
+                menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
+            return menu
+
+        def _disable_menu(self, rumps):
+            menu = rumps.MenuItem("Disable / enable account")
+            accounts = self.snapshot["accounts"]
+            if not accounts:
+                menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
+                name = f"{alias}  ({email})" if alias else email
+                item = rumps.MenuItem(
+                    f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
+                )
+                # A check-mark reads as "held out of rotation" — same glyph the
+                # active row uses, but here it means disabled, not selected.
+                item.state = 1 if disabled else 0
+                menu.add(item)
             return menu
 
         def _history_menu(self, rumps):
@@ -564,6 +754,12 @@ def run(switcher) -> int:
                 ch.state = 1 if self.settings.title_pct == mode else 0
                 title_pct.add(ch)
             menu.add(title_pct)
+
+            scoped_item = rumps.MenuItem(
+                "Show model limits in title", callback=self.on_toggle_scoped
+            )
+            scoped_item.state = 1 if self.settings.title_scoped else 0
+            menu.add(scoped_item)
 
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
@@ -622,7 +818,23 @@ def run(switcher) -> int:
 
         def _switch(self, strategy):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch(strategy=strategy)):
+                # Same comparison the CLI makes: the usage-aware strategies
+                # fold in autoswitch.model's per-model weekly windows, so the
+                # menu never picks an account the engine would reject.
+                models = ()
+                if strategy is not None:
+                    models = parse_model_names(
+                        load_settings(self.switcher.backup_dir).model
+                    )
+
+                def switch():
+                    return self.switcher.switch(
+                        strategy=strategy,
+                        models=models,
+                        model_source="autoswitch.model" if models else None,
+                    )
+
+                if self._guard(switch):
                     self._notify_switched()
                     self.refresh_async()
             return cb
@@ -637,6 +849,16 @@ def run(switcher) -> int:
                 ) == 1:  # 1 == OK
                     if self._guard(lambda: self.switcher.remove_account(str(num), assume_yes=True)):
                         self.refresh_async()
+            return cb
+
+        def _make_toggle_disabled(self, num, disabled):
+            # `disabled` is this row's current state; selecting it flips it.
+            target = not disabled
+            def cb(_sender):
+                if self._guard(
+                    lambda: self.switcher.set_account_disabled(str(num), target)
+                ):
+                    self.refresh_async()
             return cb
 
         def on_add_login(self, _sender):
@@ -710,6 +932,10 @@ def run(switcher) -> int:
             self.settings.show_account_name = not self.settings.show_account_name
             self._save_and_rebuild()
 
+        def on_toggle_scoped(self, _sender):
+            self.settings.title_scoped = not self.settings.title_scoped
+            self._save_and_rebuild()
+
         def _make_title_pct(self, mode):
             def cb(_sender):
                 self.settings.title_pct = mode
@@ -736,9 +962,6 @@ def run(switcher) -> int:
             else:
                 self._stop_engine()
             self.rebuild_menu()
-
-        def _make_threshold(self, pct):
-            return self._make_window_threshold("5h", pct)
 
         def _make_window_threshold(self, key, pct):
             def cb(_sender):

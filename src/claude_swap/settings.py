@@ -1,9 +1,9 @@
 """Tool settings persisted at ``<backup_root>/settings.json``.
 
 One versioned JSON file for user-tunable claude-swap preferences, written
-atomically with the backup dir's 0600/0700 modes. v1 carries only the
-``autoswitch`` section; other sections can be added additively. Unknown keys
-(future fields, other tools' experiments) survive a round trip.
+atomically with the backup dir's 0600/0700 modes. v1 carries the
+``autoswitch`` and ``ui`` sections; other sections can be added additively.
+Unknown keys (future fields, other tools' experiments) survive a round trip.
 
 Reading is forgiving — a missing or corrupt file yields defaults with a logged
 warning, never a crash — so a bad hand edit degrades to default behavior.
@@ -21,13 +21,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap.exceptions import ConfigError
+from claude_swap.fsutil import replace_with_retry
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
-# Kept for backwards-compatible parsing of old automatic invocations.  The
-# auto engine now applies one reset-first policy for every value.
-AUTOSWITCH_STRATEGIES = ("reset-first", "best", "fable-best", "lowest", "lowest-fable")
-SWITCH_STRATEGIES = ("best", "next-available", "fable-best")
+# Manual ``cswap switch --strategy`` choices. Automatic switching has no
+# strategy choice: one Fable-first policy, see AutoSwitchSettings.
+SWITCH_STRATEGIES = ("best", "next-available")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -36,10 +36,28 @@ _logger = logging.getLogger("claude-swap")
 class AutoSwitchSettings:
     """Policy knobs for the auto-switch engine (``cswap auto``).
 
-    Automatic switching uses independent limits for each quota window.  The
-    old ``threshold``/strategy fields remain as compatibility aliases for
-    existing settings files and callers; the engine uses the three explicit
-    limits below.
+    **One policy, per-window limits.** The engine switches only when the
+    ACTIVE account reaches a limit on one of its three quota windows —
+    ``five_hour_threshold``, ``seven_day_threshold``, ``fable_threshold`` —
+    and never to spread load. Defaults 95/98/98: the 5h window recycles
+    within a session so it is worth leaving margin for the macOS ~30s
+    Keychain pickup tail, while the 7d and Fable windows are worth burning
+    nearly dry because a switch cannot get them back.
+
+    ``threshold`` is the deprecated single-window spelling, kept so existing
+    settings files, ``--threshold`` and older frontends keep working. It
+    tracks the 5h limit and nothing else.
+
+    ``cooldown_seconds``, ``hysteresis_pct`` and ``strategy`` are inert: a
+    limit handoff is immediate (delaying it strands the user at a hard
+    limit), and with no proactive rebalancing there is no flap for a
+    hysteresis margin or a strategy choice to arbitrate. They are retained
+    as accepted-and-ignored keys, not read by the engine.
+
+    ``enabled``/``paused`` are the detached background worker's control state
+    (``cswap auto start|stop|pause|resume``), not policy: ``enabled`` is what
+    the worker supervisor persists across restarts, while ``paused`` makes
+    each automatic tick a no-op.
     """
 
     enabled: bool = False
@@ -48,15 +66,30 @@ class AutoSwitchSettings:
     five_hour_threshold: float = 95.0
     seven_day_threshold: float = 98.0
     fable_threshold: float = 98.0
-    interval_seconds: float = 15.0
+    interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "reset-first"
-    rebalance: bool = False
-    rebalance_min_improvement_pct: float = 20.0
-    rebalance_cooldown_seconds: float = 600.0
+    strategy: str = "fable-first"
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
+    # Comma-separated model display name(s) (e.g. "Opus" or "Opus,Sonnet"), or
+    # "all" for every scoped window an account reports. Each named model's
+    # per-model weekly limit is folded into the binding window used for manual
+    # switch strategies and poll cadence. Fable is NOT configured here — it is
+    # a built-in axis of the automatic policy (``fable_threshold``) and applies
+    # whether or not it is named. None = account-wide 5h/7d only (default).
+    model: str | None = None
+
+
+@dataclass(frozen=True)
+class UiSettings:
+    """Appearance preferences (``ui`` section). ``theme`` selects the TUI/CLI
+    color theme; ``auto`` follows terminal-background detection."""
+
+    theme: str = "auto"
+
+
+_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
 
 
 @dataclass(frozen=True)
@@ -68,7 +101,7 @@ class SettingSpec:
     (`parse_setting_value`) read from here, so the two can't drift.
     """
 
-    section: str  # top-level JSON section ("autoswitch")
+    section: str  # top-level JSON section ("autoswitch", "ui")
     json_key: str  # camelCase key inside the section
     field: str  # snake_case AutoSwitchSettings field
     kind: str  # "float" | "int" | "bool" | "choice"
@@ -83,7 +116,7 @@ class SettingSpec:
 
     @property
     def default(self):
-        return getattr(AutoSwitchSettings(), self.field)
+        return getattr(_SECTION_DEFAULT_SOURCES[self.section](), self.field)
 
 
 # settings.json uses camelCase (matching the repo's other JSON artifacts);
@@ -106,48 +139,38 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "fiveHourThreshold", "five_hour_threshold", "float",
             50.0, 99.9,
-            help="Switch when 5-hour usage reaches this pct",
+            help="Switch when the active account's 5-hour usage reaches this pct",
         ),
         SettingSpec(
             "autoswitch", "sevenDayThreshold", "seven_day_threshold", "float",
             50.0, 99.9,
-            help="Switch when 7-day usage reaches this pct",
+            help="Switch when the active account's 7-day usage reaches this pct",
         ),
         SettingSpec(
             "autoswitch", "fableThreshold", "fable_threshold", "float",
             50.0, 99.9,
-            help="Switch when Fable usage reaches this pct",
+            help="Switch when the active account's Fable usage reaches this pct",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
-            help="Poll interval for the cswap auto loop, in seconds",
+            help="Engine wake interval, in seconds (fetches follow the poll plan)",
         ),
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
-            help="Deprecated; reset-first threshold handoffs are immediate",
+            help="Deprecated; a limit handoff is immediate",
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="Deprecated; reset-first selection has no hysteresis",
+            help="Deprecated; the engine never switches to spread load",
         ),
+        # Free text, not a choice: the engine has one policy, and a legacy
+        # value ("lowest-fable", "consume-first", "reset-first") must migrate
+        # to it SILENTLY — the background worker reloads settings every tick,
+        # so a per-tick warning would be a log flood, and clamping to the
+        # default would rewrite the user's file on the next save.
         SettingSpec(
-            "autoswitch", "strategy", "strategy", "choice",
-            choices=AUTOSWITCH_STRATEGIES,
-            help="Deprecated aliases; automatic selection is reset-first",
-        ),
-        SettingSpec(
-            "autoswitch", "rebalance", "rebalance", "bool",
-            help="Deprecated; automatic selection waits for a quota threshold",
-        ),
-        SettingSpec(
-            "autoswitch", "rebalanceMinImprovementPct",
-            "rebalance_min_improvement_pct", "float", 0.0, 50.0,
-            help="Deprecated; no early rebalance is performed",
-        ),
-        SettingSpec(
-            "autoswitch", "rebalanceCooldownSeconds",
-            "rebalance_cooldown_seconds", "float", 0.0, 86400.0,
-            help="Deprecated; no early rebalance is performed",
+            "autoswitch", "strategy", "strategy", "string",
+            help="Deprecated; automatic switching is always Fable-first",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
@@ -157,16 +180,40 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
             help="Consecutive failed polls before an account is unhealthy",
         ),
+        SettingSpec(
+            "autoswitch", "model", "model", "string",
+            help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
+            help="Color theme; auto follows the terminal background",
+        ),
     )
 }
 
 _AUTOSWITCH_KEYS: dict[str, str] = {
-    spec.field: spec.json_key for spec in SETTING_SPECS.values()
+    spec.field: spec.json_key
+    for spec in SETTING_SPECS.values()
+    if spec.section == "autoswitch"
 }
 
 
 def settings_path(backup_root: Path) -> Path:
     return backup_root / SETTINGS_FILENAME
+
+
+def parse_model_names(value: str | None) -> tuple[str, ...]:
+    """Split a comma-separated model list, trimmed and case-insensitively
+    deduped (first spelling wins). Shared by the auto engine and the manual
+    switch strategies so both read ``autoswitch.model`` identically."""
+    if not value:
+        return ()
+    seen: dict[str, str] = {}
+    for part in value.split(","):
+        name = part.strip()
+        if name and name.lower() not in seen:
+            seen[name.lower()] = name
+    return tuple(seen.values())
 
 
 def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
@@ -179,12 +226,18 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
     kwargs = {}
     for spec in SETTING_SPECS.values():
+        if spec.section != "autoswitch":
+            continue
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
             clamped = num(value, spec.default, spec.lo, spec.hi)
             kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
         elif spec.kind == "bool":
             kwargs[spec.field] = bool(value)
+        elif spec.kind == "string":
+            # A non-empty string keeps as-is; anything else reverts to default
+            # (None) so a null/garbage settings.json value disables the filter.
+            kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
         else:  # choice
             if value not in spec.choices:
                 _logger.warning(
@@ -220,24 +273,38 @@ def load_settings(backup_root: Path) -> AutoSwitchSettings:
     for field, json_key in _AUTOSWITCH_KEYS.items():
         if json_key in section:
             kwargs[field] = section[json_key]
-    # A pre-reset-first settings file only has ``threshold``.  Preserve that
-    # user's chosen 5h limit while the new weekly/Fable defaults take effect.
+    # ``threshold`` and ``fiveHourThreshold`` are the same limit under two
+    # spellings. Whichever the file carries wins, so a settings.json written
+    # before the per-window split keeps the user's chosen 5h limit, and one
+    # written after it stays readable by frontends that only know
+    # ``threshold``. Legacy per-window keys with no successor
+    # (``rebalance*``) are ignored here and preserved verbatim on save.
     if "fiveHourThreshold" not in section and "threshold" in section:
         kwargs["five_hour_threshold"] = section["threshold"]
     elif "fiveHourThreshold" in section and "threshold" not in section:
-        # Keep the legacy in-memory field coherent for older frontends.
         kwargs["threshold"] = section["fiveHourThreshold"]
-    legacy_strategy = section.get("strategy")
-    if legacy_strategy in {"best", "fable-best", "lowest", "lowest-fable"}:
-        _logger.warning(
-            "settings.json: automatic strategy %r is deprecated; using reset-first",
-            legacy_strategy,
-        )
     try:
         settings = AutoSwitchSettings(**kwargs)
     except TypeError:
         settings = AutoSwitchSettings()
     return _clamped(settings)
+
+
+def load_ui_settings(backup_root: Path) -> UiSettings:
+    """Load the ui section; missing/corrupt file or unknown theme → default."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("ui")
+    default = UiSettings()
+    if not isinstance(section, dict):
+        return default
+    theme = section.get("theme", default.theme)
+    if theme not in SETTING_SPECS["ui.theme"].choices:
+        _logger.warning(
+            "settings.json: unsupported ui.theme %r; using %r",
+            theme, default.theme,
+        )
+        return default
+    return UiSettings(theme=theme)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -293,6 +360,14 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"{spec.dotted} must be one of: {', '.join(spec.choices)}"
             )
         return raw_value
+    if spec.kind == "string":
+        value = raw_value.strip()
+        if not value:
+            raise ConfigError(
+                f"{spec.dotted} expects a non-empty value; use "
+                f"'cswap config unset {spec.dotted}' to clear it"
+            )
+        return value
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
     except ValueError:
@@ -310,6 +385,8 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
 
 def format_setting_value(value) -> str:
     """Render a settings value the way settings.json writes it."""
+    if value is None:
+        return "(none)"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, float) and value.is_integer():
@@ -391,12 +468,15 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     reflects the file, not value equality.
     """
     raw = _read_raw(settings_path(backup_root))
-    effective = load_settings(backup_root)
+    loaded = {
+        "autoswitch": load_settings(backup_root),
+        "ui": load_ui_settings(backup_root),
+    }
     rows = []
     for spec in SETTING_SPECS.values():
         section = raw.get(spec.section)
         is_set = isinstance(section, dict) and spec.json_key in section
-        rows.append((spec, getattr(effective, spec.field), is_set))
+        rows.append((spec, getattr(loaded[spec.section], spec.field), is_set))
     return rows
 
 
@@ -406,8 +486,9 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     for attr, field in (
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
-        ("strategy", "strategy"),
         ("include_api_key_accounts", "include_api_key_accounts"),
+        ("model", "model"),
+        ("strategy", "strategy"),
         ("five_hour_threshold", "five_hour_threshold"),
         ("seven_day_threshold", "seven_day_threshold"),
         ("fable_threshold", "fable_threshold"),
@@ -417,10 +498,12 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
             overrides[field] = value
             if field == "five_hour_threshold":
                 overrides["threshold"] = value
-    # ``--threshold`` is the old spelling and intentionally maps only to the
-    # 5h limit now that weekly and Fable limits are independent.
+    # ``--threshold`` is the deprecated spelling and sets the 5h limit ONLY —
+    # deliberately not fanned across the 7d and Fable windows, whose limits
+    # are independent policy. Applied after the loop so an explicit
+    # ``--five-hour-threshold`` on the same command line wins.
     legacy_threshold = getattr(args, "threshold", None)
-    if legacy_threshold is not None:
+    if legacy_threshold is not None and "five_hour_threshold" not in overrides:
         overrides["threshold"] = legacy_threshold
         overrides["five_hour_threshold"] = legacy_threshold
     if not overrides:
@@ -433,18 +516,39 @@ def atomic_write_json(path: Path, data: dict) -> None:
 
     Shared by settings.json and the autoswitch state file (and any future
     machine-local state files beside them).
+
+    **Writes THROUGH a symlink, never over it.** A rename swaps a directory
+    ENTRY and does not follow links, so renaming onto a symlinked path
+    DETACHES the link: the write succeeds, the content is right, and the
+    link target silently stops receiving updates — until something restores
+    the link (a dotfiles deploy), taking every change written since with
+    it. Same shape as #192/#193, which fixed ``session.py``'s own writer;
+    this is the shared JSON writer. Three consequences, each deliberate:
+
+    - A DANGLING link still writes where it points; linking a path is a
+      request to write there.
+    - The temp file is created beside the RESOLVED target, so the rename
+      stays on one filesystem and remains atomic (beside the LINK it would
+      hit EXDEV whenever the target lives on another mount).
+    - The 0700 hardening stays on the directory cswap owns. Applying it to
+      the resolved parent would narrow a directory belonging to something
+      else, and raise ``PermissionError`` outright when that parent is not
+      ours to chmod. The written file still gets 0600, and ``mkstemp``
+      creates it 0600 to begin with, so the secret is never exposed.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    target = Path(os.path.realpath(path)) if path.is_symlink() else path
+    target.parent.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
+        # `path.parent`, NOT the target's: see the docstring.
         os.chmod(path.parent, 0o700)
-    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    fd, tmp_path = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
     try:
         os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
         os.close(fd)
         fd = -1
-        os.replace(tmp_path, str(path))
+        replace_with_retry(tmp_path, str(target))
         if sys.platform != "win32":
-            os.chmod(str(path), 0o600)
+            os.chmod(str(target), 0o600)
     except BaseException:
         if fd >= 0:
             os.close(fd)

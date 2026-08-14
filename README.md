@@ -52,6 +52,8 @@ Log in with another account, then:
 cswap add
 ```
 
+Do not run `/logout` first: current Claude Code may revoke the refresh token stored for the account you are leaving.
+
 ### Switch accounts
 
 Rotate to the next account:
@@ -65,6 +67,7 @@ Or switch to a specific account:
 ```bash
 cswap switch 2
 cswap switch user@example.com
+cswap switch dev                # or by alias, once set with `cswap alias 2 dev`
 ```
 
 Not sure which one? `cswap list` is the dashboard — every account's 5-hour and 7-day usage and reset times at a glance:
@@ -73,18 +76,18 @@ Not sure which one? `cswap list` is the dashboard — every account's 5-hour and
 cswap list
 ```
 
-Manual usage-aware choices remain available with `cswap switch --strategy best`, `--strategy next-available`, and `--strategy fable-best`. These manual strategies do not affect automatic switching.
+Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts). Add `--model Fable` to weigh a model's weekly window too.
 
 **Note:** You usually don't need to restart — on Linux/Windows the new account is picked up automatically, and on macOS after the Keychain cache expires. To apply it instantly, restart Claude Code or reopen the VS Code extension tab. See [Tips](#tips) for the per-platform details.
 
 ### Automatic switching
 
-Let claude-swap watch your usage and switch for you. Automatic switching uses one reset-first policy: it prefers an eligible account with the soonest Fable reset, then falls back to the soonest weekly/5-hour reset. It hands off immediately when any active quota reaches its limit (5h 95%, 7d 98%, Fable 98% by default):
+Let claude-swap watch your usage and switch for you. It never rebalances proactively: the active account keeps working until one of its own windows crosses that window's configured limit (5h 95%, 7d 98%, Fable 98% by default), then it hands off to the account with the most Fable headroom among those still under their 5h/7d limits — or, when no eligible account reports Fable, to the one with the most 5h/7d headroom:
 
 ```bash
-cswap auto                     # foreground loop, polls every 15s
-cswap auto --five-hour-threshold 95
-cswap auto --seven-day-threshold 98 --fable-threshold 98
+cswap auto                     # foreground loop, wakes every 60s
+cswap auto --five-hour-threshold 90         # hand off earlier on the 5h window
+cswap auto --seven-day-threshold 95 --fable-threshold 95
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto start               # detach a background worker
@@ -98,12 +101,15 @@ cswap auto stop                # stop the background worker
 <summary>How it behaves & advanced usage</summary>
 
 - Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.
-- Threshold handoffs are immediate. An account is eligible only while every reported quota is below its own limit; when every alternate is blocked, the worker sleeps until the earliest account can become eligible.
-- Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, exhausted ones left alone until they reset — so API traffic stays flat no matter how many accounts you manage.
+- Handoffs happen only at a limit — no cooldown, hysteresis, or load balancing. A 5-hour or weekly limit always triggers; Fable triggers only when another account is below its own 5-hour, weekly, and Fable limits. Targets prefer the most Fable headroom, then general 5-hour/weekly headroom. If every account has exhausted Fable, the worker waits for a 5-hour or weekly trigger and chooses the freest general account instead of cycling accounts.
+- The limits are `autoswitch.fiveHourThreshold` (95), `autoswitch.sevenDayThreshold` (98), and `autoswitch.fableThreshold` (98), each overridable for one run with `--five-hour-threshold` / `--seven-day-threshold` / `--fable-threshold`. `--threshold` (deprecated alias for the 5-hour limit only), `--cooldown`, and `--strategy` still parse for compatibility, as do the `autoswitch.cooldownSeconds`, `autoswitch.hysteresisPct`, and `autoswitch.strategy` settings — all inert: the policy above is the only one, and a legacy strategy value migrates to it silently.
+- Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage. `autoswitch.intervalSeconds` (or `--interval`; default 60, minimum 15) is only how often the worker wakes and re-evaluates what it already knows; each account's next usage request is gated by its persisted poll plan, so a shorter interval buys faster reaction, never more network calls.
 - `cswap auto start` sets `autoswitch.enabled=true` and launches a detached worker. Use `cswap auto pause` before logging into Claude and running `cswap add`; it keeps the worker alive but makes every automatic tick a no-op until `cswap auto resume`. `cswap auto stop` flips `autoswitch.enabled` back to false and stops the worker. `cswap config set autoswitch.enabled true|false` does the same thing. Installing the tool never starts it by itself.
-- Configure independent limits with `autoswitch.fiveHourThreshold`, `autoswitch.sevenDayThreshold`, and `autoswitch.fableThreshold`. The old `autoswitch.threshold`, `--threshold`, and automatic `--strategy` values are accepted as deprecated compatibility aliases.
 - It fails safe: if a usage check errors it keeps trusting the last-known numbers while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).
-- An account whose refresh token has died is quarantined and reported until you log in with it and re-run `cswap add --slot N`. API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
+- An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
+- To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
+- Fable counts out of the box: its weekly window is one of the three limits, and Fable headroom picks the target. Other per-model weekly windows only count if you ask — `--model Opus` (or `cswap config set autoswitch.model Opus`, comma-separated, or `all`) folds those windows into the handoff test as well.
+  - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
 
 For cron/systemd timers, `--once` reports the outcome in its exit code (`0` switched, `1` error, `2` nothing to do, `3` blocked — no viable target), and `--json` emits one JSON event per line:
 
@@ -111,7 +117,7 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 */5 * * * * cswap auto --once --json >> ~/.cswap-auto.log 2>&1
 ```
 
-The three automatic limits and background flag are configurable with `cswap config set autoswitch.fiveHourThreshold 95`, `cswap config set autoswitch.sevenDayThreshold 98`, and `cswap config set autoswitch.fableThreshold 98` (see [Configuration](#configuration)).
+Limits live in `settings.json` — `cswap config set autoswitch.fiveHourThreshold 90` and friends — and flags override them for a single run. The background worker is toggled with `cswap auto start` / `cswap auto stop`, or `cswap config set autoswitch.enabled true|false` (see [Configuration](#configuration)).
 
 </details>
 
@@ -126,14 +132,41 @@ cswap run 2 -- --resume         # everything after '--' is forwarded to claude
 cswap run 2 --share-history     # share your chat history with this account too
 ```
 
-Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, etc.), but each account keeps its own chat history. Pass `--share-history` if you want your accounts to continue the same conversations — a session started under one account shows up in `--resume` under the others, and nothing already saved is lost. Not supported on Windows yet.
+Sessions use your normal `~/.claude` setup (settings, CLAUDE.md, skills, MCP servers, etc.), but each account keeps its own chat history — pass `--share-history` if you want your accounts to continue the same conversations.
+
+<details>
+<summary>Sharing details — MCP servers & chat history</summary>
+
+- With `--share-history`, a session started under one account shows up in `--resume` under the others, and nothing already saved is lost.
+- User-scope MCP servers (`claude mcp add -s user`) are mirrored from your default profile on every launch — manage them there; changes made inside a session don't persist. Definitions are copied as-is (including inline `env`/`headers` values), but MCP OAuth logins are not — HTTP servers may ask you to authenticate once per profile via `/mcp`.
+- `--no-share` turns sharing off and removes the mirrored MCP config (profiles that never mirrored are left alone).
+
+</details>
+
+<details>
+<summary>Map accounts to directories — auto-pick per repo</summary>
+
+Bind a directory to an account, and a bare `cswap run` there launches that account in session mode — e.g. work account in work repos, personal elsewhere:
+
+```bash
+cswap map 2 ~/work/client-app   # map a directory to account 2
+cswap map user@example.com      # map the current directory
+cswap map                       # list mappings
+cswap unmap ~/work/client-app   # remove one (defaults to current directory)
+
+cd ~/work/client-app/src
+cswap run                       # → account 2, session mode
+```
+
+Subfolders inherit the nearest mapped ancestor. In an unmapped directory, `cswap run` just launches plain `claude` with your default login. Mappings are per-machine (not part of `cswap export`) and are cleaned up when their account is removed.
+
+</details>
 
 ### Interactive dashboard (TUI)
 
 Run `cswap` on its own (or `cswap tui`) for the full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. `cswap watch` opens it straight to the live monitor. Works on macOS, Linux, and Windows.
 
 <img src="assets/tui-watch.png" width="760" alt="cswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
-
 
 ### Refresh expired tokens
 
@@ -157,9 +190,19 @@ cswap auto resume               # Resume switching after account changes
 cswap auto stop                 # Stop the background auto-switch worker
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
+cswap list --token-status       # Add source-labelled OAuth token diagnostics
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
+cswap add --alias dev           # Add account and give it a short alias
 cswap remove 2                  # Remove an account
+cswap disable 2                 # Hold an account out of auto-rotation (keeps its login)
+cswap enable 2                  # Return a disabled account to rotation
+cswap alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
+cswap alias 2 --unset           # Remove an account's alias
+cswap alias                     # List all aliases
+cswap move 2 1                  # Assign an account to a slot (relocates to an empty slot, swaps if taken)
+cswap unclaimed                 # List stashed credential entries (slot + why they were stashed)
+cswap unclaimed --purge ID      # Drop one (deletes its bytes; recover with /login + `cswap add`)
 cswap tui                       # Interactive dashboard (also: bare `cswap`)
 cswap watch                     # Dashboard, opened on the live watch page
 cswap upgrade                   # Upgrade claude-swap to the latest version
@@ -176,10 +219,13 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 ## How it works
 
 - Backs up OAuth tokens and config when you add an account
-- Swaps credentials when you switch accounts
+- Swaps only the account-specific Claude login when you switch accounts;
+  live account-independent OAuth state (such as MCP server logins) is
+  preserved instead of being overwritten by a slot's older snapshot
 - Account credentials stored securely using platform-appropriate methods
 - Switches (manual and automatic) hold Claude Code's own credential locks while writing, so a swap never interleaves with a token refresh
-- Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover with `cswap add --slot N`)
+- Auto-switch freshens a target's token before activating it, and quarantines accounts whose refresh token has died (recover by re-adding it with `cswap add --slot N`, or by replacing its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots automatically)
+- Usage numbers refresh every few minutes — faster for an account being used or close to switching, slower for idle ones — keeping cswap comfortably inside Anthropic's rate limits however many dashboards you keep open on a machine. An age note like `· 6m ago` just means the next scheduled check hasn't come yet, not that something is stuck.
 
 ## Data locations
 
@@ -205,7 +251,7 @@ uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar
 cswap menubar
 ```
 
-Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
+Shows every account's 5h / 7d / spend usage and switches with a click (specific / rotate / best / next-available), plus the TUI's add / disable-enable / remove / refresh actions. Enable *Settings → Auto-switch accounts* to run the same engine as [`cswap auto`](#automatic-switching) in the background; it shares the `autoswitch.*` settings, so the menu bar and CLI stay in sync. Off until you turn it on.
 
 </details>
 
@@ -221,12 +267,13 @@ Tool preferences live in `settings.json` in the backup root; `cswap config` read
 ```bash
 cswap config                              # list effective settings ("(default)" = not set)
 cswap config get autoswitch.fiveHourThreshold
-cswap config set autoswitch.enabled true  # same as: cswap auto start
-cswap config set autoswitch.fiveHourThreshold 95
+cswap config set autoswitch.fiveHourThreshold 95  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.sevenDayThreshold 98
 cswap config set autoswitch.fableThreshold 98
-cswap config set autoswitch.intervalSeconds 15
-cswap config unset autoswitch.fableThreshold   # back to the default
+cswap config set autoswitch.intervalSeconds 30    # worker wake interval (default 60, min 15), not the poll rate
+cswap config set autoswitch.model Opus    # fold extra per-model windows in (Fable is built in)
+cswap config set autoswitch.enabled true  # same as: cswap auto start
+cswap config unset autoswitch.fableThreshold  # back to the default
 cswap config path                         # where settings.json lives
 ```
 
@@ -241,12 +288,12 @@ Move account data between machines or back it up:
 ```bash
 cswap export backup.cswap                    # All accounts to a file
 cswap export backup.cswap --account 2        # One account
-cswap export backup.cswap --full             # Include full local ~/.claude.json (same-PC backup)
+cswap export backup.cswap --full             # Include full ~/.claude.json and credential object (same-PC backup)
 cswap import backup.cswap                    # Skips accounts that already exist
 cswap import backup.cswap --force            # Overwrite existing
 ```
 
-The export file is plaintext JSON. If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
+The export file is plaintext JSON and, by default, carries only each account's own login — machine-shared MCP/plugin OAuth tokens and the device token stay on the source machine (`--full` keeps everything, for same-PC backups). If you need encryption, pipe through your tool of choice (e.g. `cswap export - | gpg -c > backup.gpg`).
 
 If an imported account is the one you're currently logged in as, activate the imported credentials with `cswap switch N --force` (a plain `switch` to the current account is a safe no-op and won't touch the import).
 
@@ -258,7 +305,6 @@ Add `--json` to `list`, `status`, or `switch` to emit a single machine-readable 
 cswap list --json                   # all accounts with usage/quota
 cswap status --json                 # current active account
 cswap switch --strategy best --json # switch, then report the result
-cswap switch --strategy fable-best --json
 cswap switch 2 --json
 ```
 
@@ -279,7 +325,11 @@ cswap switch 2 --json
 
 Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
 
-Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is.
+Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
+
+An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
+
+Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 
 </details>
 

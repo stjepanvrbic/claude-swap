@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Callable
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import MigrationIncomplete
+from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform, get_timestamp
 from claude_swap.switcher import KEYRING_SERVICE, SECURITY_SERVICE
 
@@ -87,7 +88,7 @@ def _mark_applied(switcher: "ClaudeAccountSwitcher", migration_id: str) -> None:
         os.write(fd, content.encode("utf-8"))
         os.close(fd)
         fd = -1
-        os.replace(tmp_path, str(path))
+        replace_with_retry(tmp_path, str(path))
         if sys.platform != "win32":
             os.chmod(str(path), 0o600)
     except BaseException:

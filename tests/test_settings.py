@@ -13,9 +13,12 @@ import pytest
 from claude_swap.exceptions import ConfigError
 from claude_swap.settings import (
     SETTING_SPECS,
+    atomic_write_json,
     AutoSwitchSettings,
+    UiSettings,
     effective_settings,
     load_settings,
+    load_ui_settings,
     merged_with_cli,
     save_settings,
     set_setting,
@@ -31,6 +34,7 @@ def _args(**kwargs) -> argparse.Namespace:
         "cooldown": None,
         "strategy": None,
         "include_api_key_accounts": None,
+        "strategy": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -62,8 +66,6 @@ class TestLoadSettings:
                 "threshold": 200,
                 "intervalSeconds": 1,
                 "hysteresisPct": -5,
-                "rebalanceMinImprovementPct": 200,
-                "rebalanceCooldownSeconds": 90000,
                 "unhealthyTicks": 0,
             }
         }))
@@ -71,8 +73,6 @@ class TestLoadSettings:
         assert loaded.threshold == 99.9
         assert loaded.interval_seconds == 15.0  # usage-cache TTL floor
         assert loaded.hysteresis_pct == 0.0
-        assert loaded.rebalance_min_improvement_pct == 50.0
-        assert loaded.rebalance_cooldown_seconds == 86400.0
         assert loaded.unhealthy_ticks == 1
 
     def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
@@ -83,11 +83,11 @@ class TestLoadSettings:
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
-    def test_unsupported_strategy_falls_back_to_default(self, tmp_path: Path):
+    def test_strategy_is_accepted_as_inert_compatibility_text(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "chaos"}})
         )
-        assert load_settings(tmp_path).strategy == AutoSwitchSettings().strategy
+        assert load_settings(tmp_path).strategy == "chaos"
 
     def test_fable_best_strategy_is_supported(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
@@ -101,6 +101,16 @@ class TestLoadSettings:
                 json.dumps({"autoswitch": {"strategy": strategy}})
             )
             assert load_settings(tmp_path).strategy == strategy
+
+    def test_consume_first_is_a_valid_strategy(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"strategy": "consume-first"}})
+        )
+        assert load_settings(tmp_path).strategy == "consume-first"
+
+    def test_set_strategy_consume_first(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "consume-first")
+        assert load_settings(tmp_path).strategy == "consume-first"
 
 
 class TestSaveSettings:
@@ -128,18 +138,50 @@ class TestSaveSettings:
         assert mode == 0o600
 
 
+class TestUiSettings:
+    def test_missing_file_defaults_to_auto(self, tmp_path: Path):
+        assert load_ui_settings(tmp_path) == UiSettings(theme="auto")
+
+    def test_reads_auto(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "auto"}}))
+        assert load_ui_settings(tmp_path).theme == "auto"
+
+    def test_reads_light(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "light"}}))
+        assert load_ui_settings(tmp_path).theme == "light"
+
+    def test_unknown_theme_clamps_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"ui": {"theme": "purple"}}))
+        assert load_ui_settings(tmp_path).theme == "auto"
+
+    def test_set_and_unset_ui_theme(self, tmp_path: Path):
+        assert set_setting(tmp_path, "ui.theme", "light") == "light"
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "ui": {"theme": "light"}}
+        assert unset_setting(tmp_path, "ui.theme") is True
+        assert "ui" not in json.loads(settings_path(tmp_path).read_text())
+
+    def test_set_rejects_bad_choice(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="dark, light"):
+            set_setting(tmp_path, "ui.theme", "purple")
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
-        spec_fields = {spec.field for spec in SETTING_SPECS.values()}
-        dataclass_fields = {
+        by_section: dict[str, set[str]] = {}
+        for spec in SETTING_SPECS.values():
+            by_section.setdefault(spec.section, set()).add(spec.field)
+        assert by_section["autoswitch"] == {
             f.name for f in AutoSwitchSettings.__dataclass_fields__.values()
         }
-        assert spec_fields == dataclass_fields
+        assert by_section["ui"] == {
+            f.name for f in UiSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        defaults = AutoSwitchSettings()
+        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
         for spec in SETTING_SPECS.values():
-            assert spec.default == getattr(defaults, spec.field)
+            assert spec.default == getattr(sources[spec.section], spec.field)
 
 
 class TestSetUnsetSetting:
@@ -163,10 +205,26 @@ class TestSetUnsetSetting:
         with pytest.raises(ConfigError, match="unknown setting"):
             set_setting(tmp_path, "autoswitch.bogus", "1")
 
+    def test_set_string_kind_round_trips(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.model", "Fable") == "Fable"
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["autoswitch"]["model"] == "Fable"
+        assert load_settings(tmp_path).model == "Fable"
+
+    def test_set_string_kind_rejects_empty(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="unset"):
+            set_setting(tmp_path, "autoswitch.model", "   ")
+        assert not settings_path(tmp_path).exists()
+
+    def test_garbage_model_value_falls_back_to_none(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"model": 123}})
+        )
+        assert load_settings(tmp_path).model is None
+
     def test_set_rejects_bool_words_strictly(self, tmp_path: Path):
         assert set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "FALSE") is False
         assert set_setting(tmp_path, "autoswitch.enabled", "yes") is True
-        assert set_setting(tmp_path, "autoswitch.rebalance", "true") is True
         with pytest.raises(ConfigError, match="true or false"):
             set_setting(tmp_path, "autoswitch.includeApiKeyAccounts", "falsy")
 
@@ -238,6 +296,85 @@ class TestMergedWithCli:
         )
         assert merged.include_api_key_accounts is True
 
+    def test_model_override(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
+        assert merged.model == "Fable"
+
     def test_strategy_override(self):
-        merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="fable-best"))
-        assert merged.strategy == "fable-best"
+        merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
+        assert merged.strategy == "consume-first"
+
+
+class TestAtomicWriteThroughSymlink:
+    """A rename does not follow links, so renaming onto a symlinked path
+    detaches it and the target silently stops updating. Covers the write
+    itself plus the two placement decisions it forces: the temp file goes
+    beside the RESOLVED target (else EXDEV across mounts), the 0700 chmod
+    stays on the directory cswap owns (else it narrows — or cannot touch —
+    a foreign one)."""
+
+    def test_write_preserves_the_link_and_updates_the_target(self, tmp_path):
+        repo = tmp_path / "repo"; repo.mkdir()
+        live = tmp_path / "live"; live.mkdir()
+        tracked = repo / "settings.json"
+        tracked.write_text(json.dumps({"tracked": True}))
+        link = live / "settings.json"
+        link.symlink_to(tracked)
+
+        atomic_write_json(link, {"written": "through"})
+
+        assert link.is_symlink(), "the dotfiles link must survive the write"
+        assert json.loads(tracked.read_text()) == {"written": "through"}
+
+    def test_dangling_link_writes_where_it_points(self, tmp_path):
+        target = tmp_path / "gone" / "settings.json"
+        link = tmp_path / "settings.json"
+        link.symlink_to(target)
+
+        atomic_write_json(link, {"dangling": "ok"})
+
+        assert link.is_symlink()
+        assert json.loads(target.read_text()) == {"dangling": "ok"}
+
+    def test_plain_file_write_unchanged(self, tmp_path):
+        p = tmp_path / "settings.json"
+        atomic_write_json(p, {"plain": 1})
+        assert not p.is_symlink()
+        assert json.loads(p.read_text()) == {"plain": 1}
+
+    def test_temp_file_is_created_beside_the_target(self, tmp_path, monkeypatch):
+        """Beside the LINK, the rename hits EXDEV whenever the target is on
+        another mount — the write fails outright. Assert the placement
+        directly; staging two filesystems in a unit test is not portable."""
+        import tempfile
+        from claude_swap import settings as S
+        repo = tmp_path / "repo"; repo.mkdir()
+        live = tmp_path / "live"; live.mkdir()
+        tracked = repo / "settings.json"; tracked.write_text("{}")
+        link = live / "settings.json"; link.symlink_to(tracked)
+        seen = []
+        real_mkstemp = tempfile.mkstemp
+        monkeypatch.setattr(
+            S.tempfile, "mkstemp",
+            lambda *a, **kw: (seen.append(kw.get("dir")), real_mkstemp(*a, **kw))[1],
+        )
+
+        atomic_write_json(link, {"x": 1})
+
+        assert seen == [str(repo)], f"tmp must land beside the target, got {seen}"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
+    def test_hardening_stays_on_the_directory_cswap_owns(self, tmp_path):
+        """The 0700 belongs to cswap's own dir. On the target's parent it
+        would narrow a foreign directory, and raise PermissionError when
+        that parent cannot be chmod'ed at all."""
+        repo = tmp_path / "repo"; repo.mkdir(mode=0o755)
+        live = tmp_path / "live"; live.mkdir()
+        tracked = repo / "settings.json"; tracked.write_text("{}")
+        link = live / "settings.json"; link.symlink_to(tracked)
+
+        atomic_write_json(link, {"x": 1})
+
+        assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
+        assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
+        assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"

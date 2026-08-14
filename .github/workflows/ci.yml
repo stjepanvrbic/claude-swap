@@ -22,7 +22,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Run tests
         run: uv run pytest
@@ -39,7 +39,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Run tests
         # Includes the TUI tests: the Textual TUI (unlike the old curses one)
@@ -58,7 +58,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
 
       - name: Run macOS Keychain tests (contract + real security wrapper)
         # faulthandler dumps every thread's stack if a test exceeds 60s — a
