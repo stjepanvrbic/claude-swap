@@ -34,6 +34,24 @@ def test_start_enables_and_launches_worker(tmp_path: Path):
     assert args[-3:] == ["claude_swap", "auto", "_worker"]
 
 
+def test_start_on_windows_uses_hidden_console(tmp_path: Path):
+    # DETACHED_PROCESS leaves no console to inherit, so the venv launcher's
+    # child python allocates a visible one; closing it kills the worker.
+    proc = Mock(pid=12345)
+
+    with patch("claude_swap.background.sys.platform", "win32"), \
+         patch("claude_swap.background._process_running", return_value=False), \
+         patch("subprocess.CREATE_NO_WINDOW", 0x08000000, create=True), \
+         patch("subprocess.DETACHED_PROCESS", 0x00000008, create=True), \
+         patch("subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True), \
+         patch("subprocess.Popen", return_value=proc) as popen:
+        background.start(tmp_path)
+
+    flags = popen.call_args.kwargs["creationflags"]
+    assert flags & 0x08000000
+    assert not flags & 0x00000008
+
+
 def test_stop_disables_and_removes_dead_pid(tmp_path: Path):
     (tmp_path / background.PID_FILENAME).write_text("12345\n")
 

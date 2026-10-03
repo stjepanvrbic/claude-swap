@@ -131,9 +131,11 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
     creationflags = 0
     popen_kwargs = {}
     if sys.platform == "win32":
+        # A hidden console, not DETACHED_PROCESS: the venv launcher's child
+        # python would otherwise open a visible console that kills it on close.
         creationflags = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
     else:
         popen_kwargs["start_new_session"] = True
