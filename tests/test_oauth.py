@@ -7,6 +7,8 @@ import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from claude_swap import oauth
 
 
@@ -60,6 +62,94 @@ class TestAccountHeadroom:
 
     def test_malformed_pct_is_ignored(self):
         assert oauth.account_headroom({"five_hour": {"pct": None}}) is None
+
+    def test_scoped_ignored_without_models_arg(self):
+        # Default behavior is unchanged: per-model windows never bind.
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Fable", "pct": 100.0}]}
+        assert oauth.account_headroom(usage) == 90.0
+
+    def test_named_model_folds_into_binding_window(self):
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Fable", "pct": 95.0}]}
+        assert oauth.account_headroom(usage, ["Fable"]) == 5.0
+
+    def test_maxed_model_is_at_limit_despite_session_headroom(self):
+        # The exact motivating case: 5h/7d fine, but the model is exhausted.
+        usage = {
+            "five_hour": {"pct": 1.0},
+            "seven_day": {"pct": 40.0},
+            "scoped": [{"name": "Fable", "pct": 100.0}],
+        }
+        assert oauth.account_headroom(usage, ["Fable"]) == 0.0
+
+    def test_model_match_is_case_insensitive(self):
+        usage = {"scoped": [{"name": "Fable", "pct": 70.0}]}
+        assert oauth.account_headroom(usage, ["fable"]) == 30.0
+
+    def test_unlisted_model_does_not_bind(self):
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Opus", "pct": 100.0}]}
+        assert oauth.account_headroom(usage, ["Fable"]) == 90.0
+
+    def test_multiple_models_take_the_worst(self):
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [
+                {"name": "Fable", "pct": 30.0},
+                {"name": "Opus", "pct": 95.0},
+                {"name": "Haiku", "pct": 50.0},
+            ],
+        }
+        # Opus binds (95%); Sonnet is absent and simply contributes nothing.
+        assert oauth.account_headroom(usage, ["Fable", "Opus", "Sonnet"]) == 5.0
+
+    def test_works_for_any_model_name(self):
+        for name in ("Opus", "Sonnet", "Haiku"):
+            usage = {"scoped": [{"name": name, "pct": 100.0}]}
+            assert oauth.account_headroom(usage, [name]) == 0.0
+
+    def test_only_scoped_and_named_yields_headroom(self):
+        # No 5h/7d at all (the live shape when the API returns only limits).
+        assert oauth.account_headroom({"scoped": [{"name": "Fable", "pct": 100.0}]}, ["Fable"]) == 0.0
+
+    def test_scoped_without_5h7d_and_unlisted_model_is_unknown(self):
+        usage = {"scoped": [{"name": "Opus", "pct": 100.0}]}
+        assert oauth.account_headroom(usage, ["Fable"]) is None
+
+    def test_all_sentinel_matches_every_scoped_window(self):
+        usage = {
+            "five_hour": {"pct": 10.0},
+            "scoped": [
+                {"name": "Fable", "pct": 30.0},
+                {"name": "Sonnet", "pct": 97.0},
+            ],
+        }
+        assert oauth.account_headroom(usage, ["all"]) == 3.0
+        assert oauth.account_headroom(usage, ["ALL"]) == 3.0
+
+
+class TestRelevantWindows:
+    """Test relevant_windows — the canonical window source."""
+
+    def test_carries_labels_pcts_and_resets(self):
+        usage = {
+            "five_hour": {"pct": 80.0, "resets_at": "2026-07-10T12:00:00Z"},
+            "seven_day": {"pct": 20.0},
+            "scoped": [
+                {"name": "Fable", "pct": 95.0, "resets_at": "2026-07-12T09:00:00Z"},
+            ],
+        }
+        assert oauth.relevant_windows(usage, ["Fable"]) == [
+            ("5h", 80.0, "2026-07-10T12:00:00Z"),
+            ("7d", 20.0, None),
+            ("Fable", 95.0, "2026-07-12T09:00:00Z"),
+        ]
+
+    def test_scoped_excluded_without_models(self):
+        usage = {"five_hour": {"pct": 10.0}, "scoped": [{"name": "Fable", "pct": 99.0}]}
+        assert oauth.relevant_windows(usage) == [("5h", 10.0, None)]
+
+    def test_non_dict_usage_is_empty(self):
+        assert oauth.relevant_windows(None) == []
+        assert oauth.relevant_windows("no credentials") == []
 
 
 class TestScopedModelHeadroom:
@@ -455,9 +545,12 @@ class TestTryRefreshOAuthCredentials:
         outcome = oauth.try_refresh_oauth_credentials(creds)
         assert outcome.error == "no_refresh_token"
 
-    def test_invalid_json_is_permanent(self):
+    def test_invalid_json_is_transient(self):
+        # Changed contract (stale-credential robustness): an unparseable blob
+        # is more likely a torn read than a credential shape — it must not
+        # produce a permanent strike-advancing verdict.
         outcome = oauth.try_refresh_oauth_credentials("not json")
-        assert outcome.error == "no_refresh_token"
+        assert outcome.error == "transient"
 
     def test_wrapper_returns_none_on_failure(self):
         err = self._http_error(400, b'{"error": "invalid_grant"}')
@@ -774,7 +867,8 @@ class TestFetchUsageForAccount:
     def test_persist_failure_logs_warning_with_recovery_hint(self, caplog, capsys):
         """If the persist callback raises, _persist logs at WARNING level with
         a recovery hint (re-run `cswap --add-account`), not debug, AND prints
-        a user-visible warning to stdout.
+        a user-visible warning to stderr, so a ``--json`` payload on stdout
+        stays one parseable object.
         """
         import logging
 
@@ -795,10 +889,11 @@ class TestFetchUsageForAccount:
         assert "1" in msg
         assert "test@example.com" in msg
 
-        # Also verify the user-visible printed warning
-        output = capsys.readouterr().out
-        assert "failed to save refreshed token" in output
-        assert "cswap --add-account" in output
+        # Also verify the user-visible printed warning, and that stdout stays clean
+        captured = capsys.readouterr()
+        assert "failed to save refreshed token" in captured.err
+        assert "cswap --add-account" in captured.err
+        assert captured.out == ""
 
 
 class TestClassifyUsageError:
@@ -928,11 +1023,13 @@ class TestTryFetchUsageOutcome:
         assert "account 1" in line
         assert "retry-after 42s" in line
         assert "a@b.c" not in line
-        # Nonzero Retry-After = the burst rule, which cswap's one-request-per-
-        # account-per-pass traffic cannot trip — the log names the real culprit.
-        assert "burst block" in line
+        # Any 429 = the usage endpoint's own budget, which cumulative polling
+        # across cswap surfaces can drain — the log says what is happening.
+        # Deliberately not scoped to the token in the wording: the budget is
+        # account/org-scoped (see poll_policy), so a re-login does not clear it.
+        assert "usage-endpoint budget" in line
 
-    def test_edge_429_warning_has_no_burst_hint(self, caplog):
+    def test_edge_429_warning_names_the_budget(self, caplog):
         import email.message
         import logging
         hdrs = email.message.Message()
@@ -954,9 +1051,9 @@ class TestTryFetchUsageOutcome:
             for r in caplog.records
             if r.levelno == logging.WARNING and "http-429" in r.getMessage()
         )
-        # "Retry-After: 0" is the ordinary sustained/edge rule — no hint.
+        # "Retry-After: 0" is the saturated-budget edge — same hint.
         assert "retry-after 0s" in line
-        assert "burst block" not in line
+        assert "usage-endpoint budget" in line
 
     def test_timeout_outcome(self):
         with patch(
@@ -973,3 +1070,875 @@ class TestTryFetchUsageOutcome:
             "1", "a@b.c", json.dumps({"claudeAiOauth": {}}), is_active=False,
         )
         assert outcome.error == "no-access-token"
+
+
+def _headers(values: dict):
+    import email.message
+    hdrs = email.message.Message()
+    for key, value in values.items():
+        hdrs[key] = value
+    return hdrs
+
+
+# Shape measured on a live setup-token account (values illustrative).
+_UNIFIED_HEADERS = {
+    "anthropic-ratelimit-unified-status": "allowed",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.34",
+    "anthropic-ratelimit-unified-5h-reset": "1790766000",
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+    "anthropic-ratelimit-unified-7d-utilization": "0.6",
+    "anthropic-ratelimit-unified-7d-reset": "1791154800",
+    "anthropic-ratelimit-unified-representative-claim": "five_hour",
+}
+
+
+class TestIsSetupToken:
+    def test_add_token_shape(self):
+        assert oauth.is_setup_token(
+            {"accessToken": "t", "scopes": ["user:inference"]}
+        )
+
+    def test_login_with_refresh_token_is_not(self):
+        assert not oauth.is_setup_token({
+            "accessToken": "t",
+            "refreshToken": "r",
+            "scopes": ["user:inference"],
+        })
+
+    def test_profile_scope_is_not(self):
+        assert not oauth.is_setup_token({
+            "accessToken": "t",
+            "scopes": ["user:inference", "user:profile"],
+        })
+
+    def test_missing_scopes_is_not(self):
+        # Unknown provenance: keep the endpoint's answer, don't spend quota.
+        assert not oauth.is_setup_token({"accessToken": "t"})
+        assert not oauth.is_setup_token(None)
+
+
+class TestParseUnifiedRatelimitHeaders:
+    def test_maps_fractions_and_epochs_to_usage_api_shape(self):
+        data = oauth.parse_unified_ratelimit_headers(_headers(_UNIFIED_HEADERS))
+        assert data["five_hour"]["utilization"] == 34.0
+        assert data["seven_day"]["utilization"] == 60.0
+        assert datetime.fromisoformat(
+            data["five_hour"]["resets_at"]
+        ).timestamp() == 1790766000
+        # Feeds build_usage_result unchanged.
+        usage = oauth.build_usage_result(data)
+        assert usage["five_hour"]["pct"] == 34.0
+        assert usage["seven_day"]["pct"] == 60.0
+        assert "clock" in usage["seven_day"]
+        assert "scoped" not in usage
+
+    def test_missing_window_is_left_out(self):
+        values = {
+            k: v for k, v in _UNIFIED_HEADERS.items() if "-7d-" not in k
+        }
+        data = oauth.parse_unified_ratelimit_headers(_headers(values))
+        assert set(data) == {"five_hour"}
+
+    def test_unusable_reset_keeps_utilization(self):
+        values = dict(_UNIFIED_HEADERS)
+        values["anthropic-ratelimit-unified-5h-reset"] = "soon"
+        data = oauth.parse_unified_ratelimit_headers(_headers(values))
+        assert data["five_hour"] == {"utilization": 34.0}
+
+    def test_no_headers(self):
+        assert oauth.parse_unified_ratelimit_headers(_headers({})) == {}
+
+    def test_fable_7d_oi_becomes_the_fable_scoped_window(self):
+        values = dict(_UNIFIED_HEADERS)
+        values["anthropic-ratelimit-unified-7d_oi-utilization"] = "0.82"
+        values["anthropic-ratelimit-unified-7d_oi-reset"] = "1791154800"
+        usage = oauth.build_usage_result(
+            oauth.parse_unified_ratelimit_headers(_headers(values))
+        )
+        [fable] = usage["scoped"]
+        assert fable["name"] == "Fable"
+        assert fable["pct"] == 82.0
+        assert datetime.fromisoformat(fable["resets_at"]).timestamp() == 1791154800
+
+    def test_rejected_status_is_kept(self):
+        values = dict(_UNIFIED_HEADERS)
+        values["anthropic-ratelimit-unified-status"] = "rejected"
+        values["anthropic-ratelimit-unified-reset"] = "1790766000"
+        data = oauth.parse_unified_ratelimit_headers(_headers(values))
+        assert datetime.fromisoformat(
+            data["rejected"]["resets_at"]
+        ).timestamp() == 1790766000
+
+
+class TestSetupTokenHeaderProbe:
+    """Setup-token accounts: the usage endpoint cannot read them, so usage is
+    read from the rate-limit headers of a 1-token model request (opt-in)."""
+
+    TOKEN = "sk-ant-oat01-secret-token"
+    USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+    def _creds(self) -> str:
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": self.TOKEN, "scopes": ["user:inference"],
+        }})
+
+    def _endpoint_error(self, code: int = 429):
+        return urllib.error.HTTPError(
+            self.USAGE_URL, code, "Too Many",
+            hdrs=_headers({"Retry-After": "318"}), fp=None,
+        )
+
+    @staticmethod
+    def _ok(headers: dict):
+        resp = MagicMock()
+        resp.headers = _headers(headers)
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def _route(self, endpoint, probe):
+        """urlopen fake: ``endpoint``/``probe`` are a response or an
+        exception for the usage GET and the messages POST respectively."""
+        calls: list = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req)
+            result = probe if req.full_url == oauth.USAGE_PROBE_URL else endpoint
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        return fake_urlopen, calls
+
+    def _fetch(self, fake_urlopen, creds=None, header_probe=True, **kw):
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            return oauth.try_fetch_usage_for_account(
+                "3", "a@b.c", creds or self._creds(),
+                is_active=kw.pop("is_active", False),
+                header_probe=header_probe, **kw,
+            )
+
+    def _probe_429(self, values: dict):
+        return urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, 429, "Too Many",
+            hdrs=_headers(values), fp=None,
+        )
+
+    def test_setup_token_skips_the_endpoint_and_probes(self, caplog):
+        import logging
+        fake, calls = self._route(
+            self._endpoint_error(), self._ok(_UNIFIED_HEADERS)
+        )
+        with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+            outcome = self._fetch(fake)
+
+        assert outcome.error is None
+        assert outcome.retry_after_s is None
+        assert outcome.usage["five_hour"]["pct"] == 34.0
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+        assert outcome.usage["source"] == oauth.USAGE_SOURCE_HEADERS
+        assert "rejected" not in outcome.usage
+        # Never the usage endpoint: its inference-only scope cannot read it.
+        assert [c.full_url for c in calls] == [oauth.USAGE_PROBE_URL]
+        probe = calls[0]
+        assert probe.get_method() == "POST"
+        assert probe.get_header("Authorization") == f"Bearer {self.TOKEN}"
+        assert probe.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
+        assert probe.get_header("Anthropic-version") == "2023-06-01"
+        body = json.loads(probe.data)
+        assert body["model"] == oauth.USAGE_PROBE_MODEL
+        assert body["max_tokens"] == 1
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any(
+            r.levelno >= logging.WARNING for r in caplog.records
+        )
+        assert not any(self.TOKEN in m for m in messages)
+
+    def test_active_account_probes_too(self):
+        fake, _ = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))
+        outcome = self._fetch(fake, is_active=True)
+        assert outcome.usage["seven_day"]["pct"] == 60.0
+
+    @pytest.mark.parametrize("is_active", [False, True])
+    def test_disabled_sends_no_request(self, is_active):
+        fake, calls = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))
+        outcome = self._fetch(fake, header_probe=False, is_active=is_active)
+        assert outcome.usage is None
+        assert outcome.error == "setup-token"
+        assert calls == []
+
+    def test_exhausted_account_reads_headers_off_the_429(self):
+        values = dict(_UNIFIED_HEADERS)
+        values["anthropic-ratelimit-unified-status"] = "rejected"
+        values["anthropic-ratelimit-unified-5h-utilization"] = "1.0"
+        fake, _ = self._route(self._endpoint_error(), self._probe_429(values))
+        outcome = self._fetch(fake)
+        assert outcome.error is None
+        assert outcome.usage["five_hour"]["pct"] == 100.0
+        assert oauth.account_headroom(outcome.usage) == 0.0
+
+    def test_rejected_probe_below_100_is_still_at_its_limit(self, caplog):
+        """A 429 whose 5h/7d numbers look healthy (another limit binds) keeps
+        the rejection and its Retry-After: never a healthy switch target."""
+        import logging
+        values = dict(_UNIFIED_HEADERS)  # 5h 34%, 7d 60%
+        values["anthropic-ratelimit-unified-status"] = "rejected"
+        values["Retry-After"] = "600"
+        fake, _ = self._route(self._endpoint_error(), self._probe_429(values))
+        before = datetime.now(timezone.utc).timestamp()
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = self._fetch(fake)
+        usage = outcome.usage
+        # Shown as measured...
+        assert usage["five_hour"]["pct"] == 34.0
+        assert usage["seven_day"]["pct"] == 60.0
+        # ...but decided on as at its limit until Retry-After passes.
+        assert usage["rejected"]["retry_after_s"] == 600.0
+        until = datetime.fromisoformat(usage["rejected"]["resets_at"]).timestamp()
+        assert before + 600 <= until <= before + 660
+        assert oauth.account_headroom(usage) == 0.0
+        assert ("rejected", 100.0, usage["rejected"]["resets_at"]) in (
+            oauth.relevant_windows(usage)
+        )
+        line = next(r.getMessage() for r in caplog.records)
+        assert "rejected" in line and "account 3" in line
+        assert "a@b.c" not in line and self.TOKEN not in line
+
+    @pytest.mark.parametrize("values", [
+        {"Retry-After": "30"},
+        # Unified headers but no rejected status: still not a quota refusal.
+        {**_UNIFIED_HEADERS, "Retry-After": "30"},
+    ])
+    def test_bare_429_stays_an_http_429_failure(self, values):
+        """Only ``unified-status: rejected`` proves the quota refuses; a bare
+        429 is a failure with its Retry-After, never zero headroom."""
+        fake, _ = self._route(self._endpoint_error(), self._probe_429(values))
+        outcome = self._fetch(fake)
+        assert outcome.usage is None
+        assert outcome.error == "http-429"
+        assert outcome.retry_after_s == 30.0
+
+    def test_revoked_token_surfaces_the_probe_401(self):
+        revoked = urllib.error.HTTPError(
+            oauth.USAGE_PROBE_URL, 401, "Unauthorized", hdrs=_headers({}), fp=None,
+        )
+        fake, _ = self._route(self._endpoint_error(), revoked)
+        outcome = self._fetch(fake)
+        assert outcome.error == "http-401"
+
+    def test_response_without_headers_is_bad_response(self):
+        fake, _ = self._route(self._endpoint_error(), self._ok({}))
+        outcome = self._fetch(fake)
+        assert outcome.usage is None
+        assert outcome.error == "bad-response"
+
+    def test_probe_network_error_is_classified(self):
+        fake, _ = self._route(
+            self._endpoint_error(), urllib.error.URLError(TimeoutError())
+        )
+        assert self._fetch(fake).error == "timeout"
+
+    def test_login_credentials_never_probe(self):
+        """A normal login's 429 is the endpoint budget: back off, don't
+        spend the account's quota."""
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "a", "refreshToken": "r", "expiresAt": future_ms,
+            "scopes": ["user:inference", "user:profile"],
+        }})
+        fake, calls = self._route(self._endpoint_error(), self._ok(_UNIFIED_HEADERS))
+        outcome = self._fetch(fake, creds=creds)
+        assert outcome.error == "http-429"
+        assert [c.full_url for c in calls] == [self.USAGE_URL]
+
+
+class TestHeaderReadingDecisions:
+    """A header-probe reading gates decisions only when it carries every
+    window the decision needs; partial readings read as unknown."""
+
+    H = oauth.USAGE_SOURCE_HEADERS
+
+    def test_partial_reading_is_unknown_not_95_headroom(self):
+        # 5h at 5% with no 7d header must not become 95% headroom.
+        usage = {"five_hour": {"pct": 5.0}, "source": self.H}
+        assert oauth.relevant_windows(usage) == []
+        assert oauth.account_headroom(usage) is None
+
+    def test_weekly_only_reading_decides(self):
+        # An Ultra account has no 5h window, and its probe carries no 5h header.
+        usage = {"seven_day": {"pct": 88.0}, "source": self.H}
+        assert oauth.relevant_windows(usage) == [("7d", 88.0, None)]
+        assert oauth.account_headroom(usage) == 12.0
+        assert oauth.account_headroom(usage, ("Fable",)) is None
+        assert oauth.account_headroom(usage, ("all",)) is None
+        with_fable = {
+            "seven_day": {"pct": 10.0},
+            "scoped": [{"name": "Fable", "pct": 70.0}],
+            "source": self.H,
+        }
+        assert oauth.account_headroom(with_fable, ("Fable",)) == 30.0
+
+    def test_endpoint_reading_is_unchanged(self):
+        # The endpoint's own partial answers keep today's meaning.
+        assert oauth.account_headroom({"five_hour": {"pct": 5.0}}) == 95.0
+
+    def test_complete_reading_decides(self):
+        usage = {
+            "five_hour": {"pct": 5.0}, "seven_day": {"pct": 60.0}, "source": self.H,
+        }
+        assert oauth.account_headroom(usage) == 40.0
+
+    def test_fable_switching_needs_the_fable_window(self):
+        base = {
+            "five_hour": {"pct": 5.0}, "seven_day": {"pct": 10.0}, "source": self.H,
+        }
+        assert oauth.account_headroom(base, ("Fable",)) is None
+        with_fable = {**base, "scoped": [{"name": "Fable", "pct": 70.0}]}
+        assert oauth.account_headroom(with_fable, ("fable",)) == 30.0
+        # Only Fable's bucket is in the headers: other models and "all" stay
+        # unknown rather than passing on the account-wide windows alone.
+        assert oauth.account_headroom(with_fable, ("Fable", "Opus")) is None
+        assert oauth.account_headroom(with_fable, ("all",)) is None
+        # Account-wide switching is unaffected by the per-model window.
+        assert oauth.account_headroom(with_fable) == 90.0
+
+    def test_rejection_binds_even_on_a_partial_reading(self):
+        from claude_swap import poll_policy
+        resets_at = "2030-01-01T00:00:00+00:00"
+        usage = {
+            "five_hour": {"pct": 5.0},
+            "rejected": {"retry_after_s": 60.0, "resets_at": resets_at},
+            "source": self.H,
+        }
+        assert oauth.relevant_windows(usage) == [("rejected", 100.0, resets_at)]
+        assert oauth.account_headroom(usage, ("Fable",)) == 0.0
+        # Reset scheduling waits for the refusal to end.
+        assert poll_policy.limiting_reset_ts(usage) == datetime.fromisoformat(
+            resets_at
+        ).timestamp()
+
+
+class TestInvalidGrantPropagation:
+    """A dead refresh-token lineage surfaces as error='invalid_grant', distinct
+    from a transient 'refresh-failed', so the store can quarantine the account."""
+
+    @staticmethod
+    def _expired_credentials() -> str:
+        from datetime import timedelta
+        past_ms = int(
+            (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000
+        )
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "old-access", "refreshToken": "dead-refresh",
+            "expiresAt": past_ms,
+        }})
+
+    @staticmethod
+    def _valid_credentials() -> str:
+        from datetime import timedelta
+        future_ms = int(
+            (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000
+        )
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "good-access", "refreshToken": "dead-refresh",
+            "expiresAt": future_ms,
+        }})
+
+    def test_proactive_refresh_invalid_grant_short_circuits(self):
+        """Expired token + dead refresh: report invalid_grant without hitting usage."""
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")), \
+             patch("claude_swap.oauth.request_usage_data") as usage:
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._expired_credentials(), is_active=False,
+            )
+        assert outcome.error == "invalid_grant"
+        usage.assert_not_called()  # no pointless 401/429 on a lost cause
+
+    def test_401_retry_invalid_grant_is_permanent(self):
+        """Valid-looking token, server 401, dead refresh → invalid_grant."""
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
+            hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._valid_credentials(), is_active=False,
+            )
+        assert outcome.error == "invalid_grant"
+
+    def test_transient_refresh_failure_is_not_permanent(self):
+        """A transient refresh failure stays 'refresh-failed', not invalid_grant."""
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", 401, "Unauthorized",
+            hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "transient")):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._valid_credentials(), is_active=False,
+            )
+        assert outcome.error == "refresh-failed"
+
+
+class TestCredentialFingerprint:
+    """Identity fingerprints for stored credentials (issue #117 guard)."""
+
+    def test_stable_across_access_token_rotation(self):
+        a = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-old", "refreshToken": "rt-1"}})
+        b = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-new", "refreshToken": "rt-1", "expiresAt": 5}})
+        assert oauth.credential_fingerprint(a) == oauth.credential_fingerprint(b)
+
+    def test_differs_across_refresh_token_rotation(self):
+        a = json.dumps({"claudeAiOauth": {"refreshToken": "rt-1"}})
+        b = json.dumps({"claudeAiOauth": {"refreshToken": "rt-2"}})
+        assert oauth.credential_fingerprint(a) != oauth.credential_fingerprint(b)
+
+    def test_full_content_fallback_for_api_keys_and_setup_tokens(self):
+        api_key = "sk-ant-api03-xyz"
+        setup = json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat01-abc"}})
+        assert oauth.credential_fingerprint(api_key) is not None
+        assert oauth.credential_fingerprint(setup) is not None
+        # Never None for real bytes: a None would make every "did it change?"
+        # comparison degenerate to "changed".
+        assert oauth.credential_fingerprint(api_key) != oauth.credential_fingerprint(setup)
+
+    def test_full_hash_never_collides_with_refresh_hash(self):
+        with_rt = json.dumps({"claudeAiOauth": {"refreshToken": "rt-1"}})
+        assert oauth.credential_fingerprint(with_rt).startswith("sha256:")
+        assert oauth.credential_fingerprint("raw-token").startswith("sha256-full:")
+
+    def test_empty_input_is_none(self):
+        assert oauth.credential_fingerprint("") is None
+
+
+class TestTokenAccountParsing:
+    """The token endpoint's optional account identity must not be discarded."""
+
+    _make_credentials = staticmethod(TestRefreshOAuthCredentials._make_credentials)
+
+    def _refresh_with_response(self, payload: dict) -> oauth.RefreshOutcome:
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(payload).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response
+        ):
+            return oauth.try_refresh_oauth_credentials(self._make_credentials())
+
+    def test_token_account_surfaced_when_present(self):
+        outcome = self._refresh_with_response({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "account": {"uuid": "acc-uuid", "email_address": "a@b.c"},
+            "organization": {"uuid": "org-uuid"},
+        })
+        assert outcome.error is None
+        assert outcome.token_account == {
+            "uuid": "acc-uuid", "email": "a@b.c", "organizationUuid": "org-uuid",
+        }
+
+    def test_token_account_absent_is_none(self):
+        outcome = self._refresh_with_response({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+        })
+        assert outcome.error is None
+        assert outcome.token_account is None
+
+    # Same strict boundary as fetch_oauth_profile: identity is opportunistic
+    # and must never break the refresh that carried it — malformed or
+    # uuid-less data is None, optional fields normalize to str-or-None.
+
+    def test_token_account_without_uuid_is_none(self):
+        outcome = self._refresh_with_response({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "account": {"email_address": "a@b.c"},
+        })
+        assert outcome.error is None
+        assert outcome.token_account is None
+
+    def test_token_account_non_string_uuid_is_none(self):
+        outcome = self._refresh_with_response({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "account": {"uuid": 12345, "email_address": "a@b.c"},
+        })
+        assert outcome.error is None
+        assert outcome.token_account is None
+
+    def test_token_account_uuid_whitespace_normalized(self):
+        """Normalization happens at the boundary so padded uuids never reach
+        comparisons or sequence.json backfills."""
+        outcome = self._refresh_with_response({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "account": {"uuid": "  acc-uuid  ", "email_address": "a@b.c"},
+        })
+        assert outcome.token_account["uuid"] == "acc-uuid"
+
+    def test_token_account_non_string_optionals_normalized(self):
+        outcome = self._refresh_with_response({
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "expires_in": 3600,
+            "account": {"uuid": "acc-uuid", "email_address": {"weird": 1}},
+            "organization": {"uuid": 99},
+        })
+        assert outcome.error is None
+        assert outcome.token_account == {
+            "uuid": "acc-uuid", "email": None, "organizationUuid": None,
+        }
+
+
+@pytest.mark.no_oauth_profile_fake
+class TestFetchOauthProfile:
+    """Access-token → account-identity resolution (/api/oauth/profile)."""
+
+    def _profile_response(self, payload: dict):
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(payload).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        return mock_response
+
+    def test_resolves_identity(self):
+        seen = {}
+
+        def mock_urlopen(req, timeout=0):
+            seen["url"] = req.full_url
+            seen["auth"] = req.headers.get("Authorization")
+            return self._profile_response({
+                "account": {"uuid": "acc-uuid", "email": "a@b.c"},
+                "organization": {"uuid": "org-uuid"},
+            })
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_oauth_profile("sk-live")
+        assert result == {
+            "uuid": "acc-uuid", "email": "a@b.c", "organizationUuid": "org-uuid",
+        }
+        assert seen["url"].endswith("/api/oauth/profile")
+        assert seen["auth"] == "Bearer sk-live"
+
+    def test_uses_bounded_timeout(self):
+        """One bounded call: the profile lookup may only ever add latency,
+        never hang a switch."""
+        seen = {}
+
+        def mock_urlopen(req, timeout=0):
+            seen["timeout"] = timeout
+            return self._profile_response({
+                "account": {"uuid": "acc-uuid", "email": "a@b.c"},
+            })
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            oauth.fetch_oauth_profile("sk-live")
+        assert seen["timeout"] == 5
+
+    def test_network_failure_is_unresolvable_not_error(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("down"),
+        ):
+            assert oauth.fetch_oauth_profile("sk-live") is None
+
+    def test_missing_account_object_is_unresolvable(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=self._profile_response({"unexpected": True}),
+        ):
+            assert oauth.fetch_oauth_profile("sk-live") is None
+
+    # Strict resolution boundary: the oracle is advisory (None keeps the
+    # switch on the fail-open path), so a response only counts as resolved
+    # with a non-empty string account.uuid — a schema change must degrade to
+    # pre-fix behavior, not to preserve-and-skip.
+
+    def test_missing_uuid_is_unresolvable(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=self._profile_response({
+                "account": {"email": "a@b.c"},
+                "organization": {"uuid": "org-uuid"},
+            }),
+        ):
+            assert oauth.fetch_oauth_profile("sk-live") is None
+
+    def test_non_string_uuid_is_unresolvable(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=self._profile_response({
+                "account": {"uuid": 12345, "email": "a@b.c"},
+            }),
+        ):
+            assert oauth.fetch_oauth_profile("sk-live") is None
+
+    def test_blank_uuid_is_unresolvable(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=self._profile_response({
+                "account": {"uuid": "   ", "email": "a@b.c"},
+            }),
+        ):
+            assert oauth.fetch_oauth_profile("sk-live") is None
+
+    def test_malformed_json_is_unresolvable(self):
+        mock_response = MagicMock()
+        mock_response.read.return_value = b"<!doctype html><html>gateway error"
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", return_value=mock_response,
+        ):
+            assert oauth.fetch_oauth_profile("sk-live") is None
+
+    def test_uuid_whitespace_normalized_at_boundary(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=self._profile_response({
+                "account": {"uuid": "  acc-uuid  ", "email": "a@b.c"},
+            }),
+        ):
+            result = oauth.fetch_oauth_profile("sk-live")
+        assert result["uuid"] == "acc-uuid"
+
+    def test_valid_uuid_with_missing_email_still_resolves(self):
+        """email/organization are optional; uuid is the identity."""
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=self._profile_response({
+                "account": {"uuid": "acc-uuid"},
+            }),
+        ):
+            result = oauth.fetch_oauth_profile("sk-live")
+        assert result == {"uuid": "acc-uuid", "email": None, "organizationUuid": None}
+
+    def test_non_string_optional_fields_are_dropped_not_fatal(self):
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen",
+            return_value=self._profile_response({
+                "account": {"uuid": "acc-uuid", "email": {"weird": True}},
+                "organization": {"uuid": 99},
+            }),
+        ):
+            result = oauth.fetch_oauth_profile("sk-live")
+        assert result == {"uuid": "acc-uuid", "email": None, "organizationUuid": None}
+
+    def test_401_is_unresolvable_with_log_file_warning(self, caplog):
+        """401 is evidence (the live token can't authenticate) but not proof —
+        fail open, and record it at warning level in the log only (the
+        console handler exists only under --debug)."""
+        import logging
+
+        err = urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/profile", 401,
+            "Unauthorized", {}, None,
+        )
+        with patch(
+            "claude_swap.oauth.urllib.request.urlopen", side_effect=err,
+        ), caplog.at_level(logging.WARNING, logger="claude-swap"):
+            assert oauth.fetch_oauth_profile("sk-live") is None
+        assert any(
+            "401" in r.message and "pre-fix" in r.message
+            for r in caplog.records
+        )
+
+
+class TestInvalidGrantTaxonomy:
+    """M3: the permanent invalid_grant verdict requires an RFC 6749 §5.2
+    parse — top-level error == "invalid_grant" in the JSON body. Substring
+    hits inside other envelopes stay transient; invalid_client is a distinct
+    systemic kind, never a dead-token verdict."""
+
+    def _refresh_with_body(self, monkeypatch, code, body):
+        import urllib.error, io
+        creds = json.dumps({
+            "claudeAiOauth": {"refreshToken": "rt-x", "accessToken": "a"}
+        })
+
+        def raise_http(*a, **k):
+            raise urllib.error.HTTPError(
+                "url", code, "err", {}, io.BytesIO(body.encode())
+            )
+
+        monkeypatch.setattr(
+            "claude_swap.oauth.urllib.request.urlopen", raise_http
+        )
+        return oauth.try_refresh_oauth_credentials(creds)
+
+    def test_rfc_invalid_grant_is_permanent(self, monkeypatch):
+        out = self._refresh_with_body(
+            monkeypatch, 400, '{"error": "invalid_grant"}'
+        )
+        assert out.error == "invalid_grant"
+
+    def test_substring_in_other_envelope_is_transient(self, monkeypatch):
+        # the marker appears only inside a nested message — not a §5.2 error
+        out = self._refresh_with_body(
+            monkeypatch, 400,
+            '{"error": "server_error", "detail": "log mentions invalid_grant"}'
+        )
+        assert out.error == "transient"
+
+    def test_invalid_client_is_systemic_not_dead_token(self, monkeypatch):
+        out = self._refresh_with_body(
+            monkeypatch, 401, '{"error": "invalid_client"}'
+        )
+        assert out.error == "invalid_client"
+
+    def test_unparseable_body_is_transient(self, monkeypatch):
+        out = self._refresh_with_body(monkeypatch, 400, "<html>oops</html>")
+        assert out.error == "transient"
+
+    def test_error_description_variant_still_permanent(self, monkeypatch):
+        out = self._refresh_with_body(
+            monkeypatch, 400,
+            '{"error": "invalid_grant", "error_description": "revoked"}'
+        )
+        assert out.error == "invalid_grant"
+
+
+class TestNoRefreshTokenStructuralGuard:
+    """M3: ``no_refresh_token`` is permanent only for a structurally complete
+    OAuth dict genuinely missing the field — an unparseable/partial blob is
+    transient (a torn read must not condemn the slot)."""
+
+    def test_complete_dict_without_rt_is_permanent(self):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "a"}})
+        out = oauth.try_refresh_oauth_credentials(creds)
+        assert out.error == "no_refresh_token"
+
+    def test_unparseable_blob_is_transient(self):
+        out = oauth.try_refresh_oauth_credentials('{"claudeAiOa')  # torn read
+        assert out.error == "transient"
+
+    def test_non_dict_payload_is_transient(self):
+        out = oauth.try_refresh_oauth_credentials('"just-a-string"')
+        assert out.error == "transient"
+
+
+class TestConsumeBusyIsDeterministic:
+    """A busy consume gate must not fall through to a guaranteed 401.
+
+    `consume-busy` means another process holds the gate — the token in hand is
+    known-expired, so calling the usage endpoint with it 401s every time, and
+    the retry re-enters the gate and gets busy again. The kind then arrives as
+    generic "refresh-failed", hiding the distinct kind this PR added and
+    spending a request per pass to learn nothing.
+    """
+
+    def test_a_busy_gate_does_not_spend_a_doomed_request(self):
+        creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "expired",
+                "refreshToken": "r",
+                "expiresAt": 1,  # long past
+            }
+        })
+        with patch("claude_swap.oauth.request_usage_data") as usage:
+            out = oauth.try_fetch_usage_for_account(
+                "1", "a@example.com", creds, is_active=False,
+                refresh_via=lambda *_: oauth.RefreshOutcome(None, "consume-busy"),
+            )
+        assert out.error == "consume-busy", out.error
+        usage.assert_not_called()
+
+    def test_every_deterministic_kind_has_a_note(self):
+        """The reason these kinds stay distinct is the note they carry.
+
+        ``try_fetch_usage_for_account`` keeps a deterministic kind rather than
+        collapsing it to "refresh-failed" because "ERROR_NOTES renders the
+        remedy for each" — a kind with no note renders the bare identifier,
+        which is strictly worse than the generic string it displaced.
+        """
+        from claude_swap.switcher import ERROR_NOTES
+
+        missing = [
+            k for k in oauth._DETERMINISTIC_REFRESH_ERRORS if k not in ERROR_NOTES
+        ]
+        assert not missing, missing
+
+
+class TestLoginExpiresAtIso:
+    def test_refresh_token_expiry_is_reported_as_iso_utc(self):
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-x", "refreshTokenExpiresAt": 1791421596865,
+        }})
+        assert oauth.login_expires_at_iso(creds) == "2026-10-08T01:06:36Z"
+
+    @pytest.mark.parametrize("creds", [
+        "",
+        "not json",
+        json.dumps({"claudeAiOauth": {"accessToken": "sk-x"}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": "soon"}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": True}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": 0}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": float("nan")}}),
+        json.dumps({"claudeAiOauth": {"refreshTokenExpiresAt": float("inf")}}),
+        json.dumps({"other": {}}),
+    ])
+    def test_anything_but_a_positive_epoch_is_unknown(self, creds):
+        assert oauth.login_expires_at_iso(creds) is None
+
+
+class TestRefusedFetchLogsTheServerReason:
+    """A 4xx other than 429 names the server's reason in the warning."""
+
+    @staticmethod
+    def _refusal(code: int, body: bytes):
+        import io
+        import urllib.error
+        from email.message import Message
+
+        return urllib.error.HTTPError(
+            "https://api.anthropic.com/api/oauth/usage", code, "refused",
+            Message(), io.BytesIO(body),
+        )
+
+    def _fetch(self, error, caplog):
+        import logging
+
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-a"}})
+        with patch("claude_swap.oauth.request_usage_data", side_effect=error), \
+             caplog.at_level(logging.WARNING, logger="claude-swap"):
+            outcome = oauth.try_fetch_usage_for_account("3", "a@x", creds, True)
+        return outcome, [r.getMessage() for r in caplog.records]
+
+    def test_403_body_rides_along_on_one_line(self, caplog):
+        body = b'{"type": "error",\n "error": {"message": "account disabled"}}'
+        outcome, messages = self._fetch(self._refusal(403, body), caplog)
+        assert outcome.error == "http-403"
+        assert messages == [
+            'Usage fetch failed for account 3: http-403 ({"type": "error", '
+            '"error": {"message": "account disabled"}})'
+        ]
+
+    def test_long_body_is_cut(self, caplog):
+        _, messages = self._fetch(self._refusal(400, b"x" * 5000), caplog)
+        assert messages == [
+            "Usage fetch failed for account 3: http-400 (" + "x" * 200 + ")"
+        ]
+
+    def test_429_keeps_its_budget_note(self, caplog):
+        _, messages = self._fetch(self._refusal(429, b"slow down"), caplog)
+        assert messages == [
+            "Usage fetch failed for account 3: http-429 "
+            "(usage-endpoint budget reached; backing off)"
+        ]

@@ -10,10 +10,61 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import plistlib
+import sys
 from pathlib import Path
 
-from claude_swap import menubar
-from claude_swap.switcher import USAGE_API_KEY
+import pytest
+
+from claude_swap import menubar, oauth
+from claude_swap.autoswitch import ErrorEvent
+from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.menubar import ENGINE_ERROR_REPEAT_S, should_surface_engine_error
+from claude_swap.switcher import USAGE_API_KEY, USAGE_RELOGIN_REQUIRED
+
+
+# --- notification identity -----------------------------------------------------
+
+def test_notification_identity_creates_and_preserves_info_plist(tmp_path: Path):
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+    info = executable.parent / "Info.plist"
+    info.write_bytes(plistlib.dumps({"ExistingKey": "kept"}))
+
+    result = menubar.ensure_notification_identity(executable, platform="darwin")
+
+    assert result == info
+    data = plistlib.loads(info.read_bytes())
+    assert data["CFBundleIdentifier"] == "com.claude-swap.menubar"
+    assert data["CFBundleName"] == "claude-swap"
+    assert data["ExistingKey"] == "kept"
+
+
+def test_notification_identity_heals_corrupt_info_plist(tmp_path: Path):
+    executable = tmp_path / "bin" / "python3"
+    executable.parent.mkdir()
+    info = executable.parent / "Info.plist"
+    # truncated XML plist: plistlib raises ExpatError, not InvalidFileException
+    info.write_bytes(
+        b'<?xml version="1.0" encoding="UTF-8"?>\n'
+        b'<plist version="1.0"><dict><key>CFBundle'
+    )
+
+    result = menubar.ensure_notification_identity(executable, platform="darwin")
+
+    assert result == info
+    data = plistlib.loads(info.read_bytes())
+    assert data["CFBundleIdentifier"] == "com.claude-swap.menubar"
+    assert data["CFBundleName"] == "claude-swap"
+    assert not (executable.parent / "Info.plist.tmp").exists()
+
+
+def test_notification_identity_is_noop_off_macos(tmp_path: Path):
+    executable = tmp_path / "bin" / "python3"
+    assert menubar.ensure_notification_identity(
+        executable, platform="linux"
+    ) is None
+    assert not (executable.parent / "Info.plist").exists()
 
 
 # --- settings ------------------------------------------------------------------
@@ -37,6 +88,19 @@ def test_settings_round_trip(tmp_path: Path):
     original.save(path)
     loaded = menubar.MenuBarSettings.load(path)
     assert loaded == original
+
+
+def test_settings_save_is_atomic(tmp_path: Path, monkeypatch):
+    # The CLI and the running menu bar share this file, and load() reads a
+    # torn write as defaults (auto-switch off), so save() must not truncate
+    # in place.
+    calls = []
+    monkeypatch.setattr(
+        menubar, "atomic_write_text", lambda path, text, **kw: calls.append((path, kw))
+    )
+    path = tmp_path / "menubar_settings.json"
+    menubar.MenuBarSettings(auto_switch_enabled=True).save(path)
+    assert calls == [(path, {"mode": 0o600})]
 
 
 def test_settings_corrupt_file_falls_back_to_defaults(tmp_path: Path):
@@ -87,6 +151,47 @@ def test_usage_summary_partial_windows():
     assert menubar.usage_summary({"five_hour": {"pct": 5.0}}) == "5h 5%"
 
 
+def test_usage_summary_includes_scoped_model_limits():
+    # Per-model weekly limits (e.g. Fable) come through as usage["scoped"], after
+    # 5h/7d and before spend.
+    usage = {
+        "five_hour": {"pct": 82.0},
+        "seven_day": {"pct": 12.0},
+        "scoped": [{"name": "Fable", "pct": 4.0}],
+        "spend": {"pct": 30.0},
+    }
+    assert menubar.usage_summary(usage) == "5h 82% · 7d 12% · Fable 4% · $ 30%"
+
+
+def test_usage_summary_leads_with_a_probe_rejection():
+    usage = {
+        "five_hour": {"pct": 20.0},
+        "seven_day": {"pct": 30.0},
+        "rejected": {
+            "retry_after_s": 3600.0,
+            "resets_at": _dt.datetime.fromtimestamp(
+                _NOW + 3600, tz=_dt.timezone.utc
+            ).isoformat(),
+        },
+    }
+    assert menubar.usage_summary(usage, _NOW) == "rejected (!) (1h 0m) · 5h 20% · 7d 30%"
+
+
+def test_usage_summary_scoped_over_limit_marker():
+    usage = {"scoped": [{"name": "Fable", "pct": 100.0}]}
+    assert menubar.usage_summary(usage) == "Fable 100% (!)"
+
+
+def test_usage_summary_scoped_multiple_and_countdown():
+    usage = {
+        "scoped": [
+            {"name": "Fable", "pct": 4.0, "resets_at": _iso(2 * 3600)},
+            {"name": "Opus", "pct": 55.0},
+        ],
+    }
+    assert menubar.usage_summary(usage, _NOW) == "Fable 4% (2h 0m) · Opus 55%"
+
+
 def test_usage_summary_string_sentinel_passthrough():
     assert menubar.usage_summary("no credentials") == "no credentials"
 
@@ -95,9 +200,118 @@ def test_usage_summary_none():
     assert menubar.usage_summary(None) == "usage unavailable"
 
 
+def test_usage_summary_seven_day_ahead_of_pace_marker():
+    # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
+    usage = {"seven_day": {"pct": 50.0, "resets_at": _iso(6 * 86400)}}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
+    assert out == "7d 50% (ahead) (6d 0h)"
+
+
+def test_usage_summary_five_hour_never_shows_pace_marker():
+    usage = {"five_hour": {"pct": 90.0, "resets_at": _iso(4 * 3600)}}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
+    assert "ahead" not in out
+
+
+def test_usage_summary_scoped_ahead_of_pace_marker():
+    usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": _iso(6 * 86400)}]}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
+    assert out == "Fable 50% (ahead) (6d 0h)"
+
+
+def test_usage_summary_maxed_scoped_marker_wins_over_pace():
+    # At/over the limit shows "(!)" — the more urgent signal — not "(ahead)".
+    usage = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(6 * 86400)}]}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
+    assert "(!)" in out
+    assert "ahead" not in out
+
+
+def test_usage_summary_no_pace_marker_without_fetched_at():
+    usage = {"seven_day": {"pct": 50.0, "resets_at": _iso(6 * 86400)}}
+    out = menubar.usage_summary(usage, _NOW)
+    assert "ahead" not in out
+
+
+def test_usage_summary_no_pace_marker_on_window_rolled_to_zero():
+    # A weekly window whose resets_at has already passed (stale cache, not
+    # refetched since the actual reset) is rolled to a display pct of 0% —
+    # pace must be computed against that rolled 0%, not the raw stale pct,
+    # or the display would show "7d 0% (ahead)" (a marker paired with a
+    # percentage it doesn't correspond to).
+    usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-3 * 86400)}}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400)
+    assert "ahead" not in out
+    assert "7d 0%" in out
+
+
+def test_usage_summary_scoped_no_pace_marker_on_window_rolled_to_zero():
+    usage = {"scoped": [{"name": "Fable", "pct": 95.0, "resets_at": _iso(-3 * 86400)}]}
+    out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW - 4 * 86400)
+    assert "ahead" not in out
+    assert "Fable 0%" in out
+
+
 def test_format_account_label():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE)
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_with_alias():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, alias="dev")
+    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_disabled_marker():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
+    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_login_due():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 5 * 86400 + 12 * 3600
+    )
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · re-login in 5d 12h"
+
+
+def test_format_account_label_login_not_due_yet_says_nothing():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now + 23 * 86400
+    )
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_login_unknown_says_nothing():
+    label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, login_expires_at=None)
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_login_past():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, now=now, login_expires_at=now - 60
+    )
+    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30% · re-login needed"
+
+
+def test_format_account_label_quarantined_row_already_says_it():
+    # The sentinel text is the row's usage summary; no second "re-login".
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED],
+        now=now, login_expires_at=now - 60, quarantined=True,
+    )
+    assert label == "2  loc@papaya.asia  re-login needed"
+
+
+def test_format_account_label_usage_unavailable_still_carries_the_note():
+    now = 1_000_000.0
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", None, now=now, login_expires_at=now + 5 * 3600 + 7 * 60
+    )
+    assert label == "2  loc@papaya.asia  usage unavailable · re-login in 5h 7m"
 
 
 # --- usage logging -------------------------------------------------------------
@@ -139,9 +353,20 @@ def test_usage_log_key_ignores_clock_tracks_pct():
 
 # --- title ---------------------------------------------------------------------
 
+def test_format_title_flags_a_rejected_active_account():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
+    usage = {**_USAGE, "rejected": {"retry_after_s": None, "resets_at": None}}
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ loc · rejected (!) · 42%"
+
+
 def test_format_title_name_and_5h():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"
+
+
+def test_format_title_prefers_alias_over_local_part():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s, alias="dev") == "⇄ dev"
 
 
 def test_format_title_name_only_when_pct_off():
@@ -174,6 +399,30 @@ def test_format_title_icon_only_when_off():
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄"
 
 
+def test_format_title_scoped_appends_model_limits():
+    # title_pct="off" + title_scoped gives a title tracking only the scoped model
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off", title_scoped=True)
+    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ loc · Fable 55%"
+
+
+def test_format_title_scoped_after_windows_multiple_models():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both", title_scoped=True)
+    usage = {
+        **_USAGE,
+        "scoped": [{"name": "Fable", "pct": 55.0}, {"name": "Opus", "pct": 7.0}],
+    }
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄ 42% · 18% · Fable 55% · Opus 7%"
+
+
+def test_format_title_scoped_off_by_default():
+    # default settings ignore scoped windows entirely
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
+    usage = {**_USAGE, "scoped": [{"name": "Fable", "pct": 55.0}]}
+    assert not s.title_scoped
+    assert menubar.format_title("loc@papaya.asia", usage, s) == "⇄"
+
+
 def test_format_title_icon_only_when_no_active_account():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
     assert menubar.format_title(None, None, s) == "⇄"
@@ -194,6 +443,14 @@ def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     # only 5h present -> 7d dropped, no trailing separator
     assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
+
+
+def test_format_title_and_summary_with_a_null_five_hour_window():
+    # Ultra accounts have no 5-hour limit; the usage API reports the window as null.
+    usage = oauth.build_usage_result({"five_hour": None, "seven_day": {"utilization": 25.0}})
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    assert menubar.format_title("loc@x.com", usage, s) == "⇄ 25%"
+    assert menubar.usage_summary(usage) == "7d 25%"
 
 
 # --- reset-time helpers --------------------------------------------------------
@@ -275,17 +532,23 @@ def test_parse_switch_history_empty_or_no_matches():
 # --- snapshot adapter (fakes for AccountsSnapshot / UsageEntry) -----------------
 
 class _FakeEntry:
-    def __init__(self, sentinel=None, last_good=None):
+    def __init__(self, sentinel=None, last_good=None, fetched_at=None):
         self.sentinel = sentinel
         self.last_good = last_good
+        self.fetched_at = fetched_at
 
 
 class _FakeAcct:
-    def __init__(self, number, email, is_active, usage):
+    def __init__(
+        self, number, email, is_active, usage, alias="", disabled=False, login_expires_at=None
+    ):
         self.number = number
         self.email = email
         self.is_active = is_active
         self.usage = usage
+        self.alias = alias
+        self.disabled = disabled
+        self.login_expires_at = login_expires_at
 
 
 class _FakeSnap:
@@ -307,19 +570,400 @@ def test_adapt_snapshot_shape_and_active_selection():
     # pacing now lives in SnapshotSource, tested separately).
     lg = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
     accts = [
-        _FakeAcct("1", "a@x.com", True, _FakeEntry(last_good=lg)),
-        _FakeAcct("2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY)),
+        _FakeAcct(
+            "1", "a@x.com", True, _FakeEntry(last_good=lg, fetched_at=123.0), login_expires_at=456.0
+        ),
+        _FakeAcct(
+            "2", "b@x.com", False, _FakeEntry(sentinel=USAGE_API_KEY), disabled=True
+        ),
+        _FakeAcct(
+            "3", "c@x.com", False, _FakeEntry(sentinel=USAGE_RELOGIN_REQUIRED)
+        ),
     ]
     snap = menubar._adapt_snapshot(_FakeSnap(accts))
     assert snap["active_email"] == "a@x.com"
     assert snap["active_usage"] == lg
-    # (num, email, is_active, display_usage, last_good)
-    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg)
-    # sentinel account: display is the human note, last_good is None
+    assert snap["active_alias"] == ""
+    # (num, email, is_active, display_usage, last_good, alias, disabled, fetched_at, login_expires_at, quarantined)
+    assert snap["accounts"][0] == ("1", "a@x.com", True, lg, lg, "", False, 123.0, 456.0, False)
+    # sentinel account: display is the human note, last_good/fetched_at are None; disabled carried through
     assert snap["accounts"][1] == (
-        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None,
+        "2", "b@x.com", False, menubar.SENTINEL_NOTES[USAGE_API_KEY], None, "", True, None, None, False,
     )
+    # the re-login sentinel is the one that marks the account quarantined
+    assert snap["accounts"][2][9] is True
 
 
 def test_adapt_snapshot_empty():
     assert menubar._adapt_snapshot(_FakeSnap([])) == menubar.EMPTY_SNAPSHOT
+
+
+def test_take_worker_snapshot_bypasses_store_only_on_explicit_refresh():
+    calls = []
+
+    class _FakeSource:
+        def take(self, *, full=False, store_only=False):
+            calls.append((full, store_only))
+            return _FakeSnap([])
+
+    source = _FakeSource()
+    _, store_only = menubar._take_worker_snapshot(
+        source, full=False, has_engine=True
+    )
+    assert store_only is True
+    assert calls[-1] == (False, True)
+
+    _, store_only = menubar._take_worker_snapshot(
+        source, full=True, has_engine=True
+    )
+    assert store_only is False
+    assert calls[-1] == (True, False)
+
+    _, store_only = menubar._take_worker_snapshot(
+        source, full=False, has_engine=False
+    )
+    assert store_only is False
+    assert calls[-1] == (False, False)
+
+
+# --- weekly reset roll-forward (static 7-day cadence) --------------------------
+
+def test_rolled_weekly_window_advances_passed_reset():
+    w = {"pct": 95.0, "resets_at": _iso(-3 * 86400), "countdown": "stale", "clock": "old"}
+    rolled = menubar._rolled_weekly_window(w, _NOW)
+    assert rolled["pct"] == 0.0  # the window objectively rolled over
+    assert abs(menubar._resets_at_ts(rolled) - (_NOW + 4 * 86400)) < 1
+    assert "countdown" not in rolled and "clock" not in rolled  # stale strings dropped
+
+
+def test_rolled_weekly_window_advances_multiple_missed_weeks():
+    w = {"pct": 80.0, "resets_at": _iso(-10 * 86400)}  # two boundaries crossed
+    rolled = menubar._rolled_weekly_window(w, _NOW)
+    assert abs(menubar._resets_at_ts(rolled) - (_NOW + 4 * 86400)) < 1
+
+
+def test_rolled_weekly_window_leaves_future_or_unknown_untouched():
+    future = {"pct": 42.0, "resets_at": _iso(2 * 86400)}
+    assert menubar._rolled_weekly_window(future, _NOW) is future
+    no_reset = {"pct": 42.0}
+    assert menubar._rolled_weekly_window(no_reset, _NOW) is no_reset
+    assert menubar._rolled_weekly_window(None, _NOW) is None
+
+
+def test_usage_summary_reflects_passed_weekly_reset():
+    # 7d reset a day ago: show it as reset (0%) with the next weekly boundary,
+    # from the static schedule alone. 5h is untouched (dynamic session window).
+    usage = {
+        "five_hour": {"pct": 10.0},
+        "seven_day": {"pct": 95.0, "resets_at": _iso(-86400)},
+    }
+    assert menubar.usage_summary(usage, _NOW) == "5h 10% · 7d 0% (6d 0h)"
+
+
+def test_usage_summary_scoped_reflects_passed_weekly_reset():
+    usage = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(-86400)}]}
+    # rolled to 0% → the over-limit "(!)" marker is gone too
+    assert menubar.usage_summary(usage, _NOW) == "Fable 0% (6d 0h)"
+
+
+def test_format_title_reflects_passed_weekly_reset():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
+    usage = {"seven_day": {"pct": 95.0, "resets_at": _iso(-86400)}}
+    assert menubar.format_title("a@x.com", usage, s, _NOW) == "⇄ 0%"
+
+
+# --- run() app glue ------------------------------------------------------------
+
+def test_run_without_rumps_raises_clean_error(monkeypatch):
+    """A missing menubar extra surfaces as ClaudeSwitchError, not a traceback.
+
+    The module is import-safe without rumps, so the CLI's ImportError guard
+    around ``from claude_swap.menubar import run`` can never fire — the import
+    failure happens inside ``run()``. Blocking the import (a ``None`` entry in
+    ``sys.modules`` makes ``import rumps`` raise) checks that ``run()`` turns
+    it into the error type the CLI renders with the install hint.
+    """
+    monkeypatch.setitem(sys.modules, "rumps", None)
+    with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
+        menubar.run(switcher=None)
+
+
+class TestFrameworkBuildWarning:
+    """The menu bar draws nothing from a framework build on macOS 26.
+
+    See #310. The interpreter *version* is not the variable — measured with the
+    same bare rumps app, Homebrew 3.14.6 and 3.10.21 (both framework) draw
+    nothing while uv-managed 3.14.7 and 3.13.15 (neither framework) draw.
+    Nothing here can fix that; these tests are about the warning, not the icon.
+    """
+
+    def test_silent_on_a_build_that_draws(self):
+        assert menubar.framework_build_warning("", "uv", "26.6.2") is None
+
+    def test_silent_on_macos_where_framework_builds_still_draw(self):
+        # The evidence is a framework build *on macOS 26*. Warning on 14 or 15
+        # would nag every Homebrew user on every launch, and in the service log
+        # on every restart, about something that works there.
+        assert menubar.framework_build_warning("Python", "uv", "15.7") is None
+        assert menubar.framework_build_warning("Python", "uv", "14.2") is None
+
+    def test_warns_from_macos_26_onwards(self):
+        assert menubar.framework_build_warning("Python", "uv", "26.0") is not None
+        assert menubar.framework_build_warning("Python", "uv", "27.1") is not None
+
+    def test_unreadable_macos_version_stays_quiet(self):
+        assert menubar.framework_build_warning("Python", "uv", "") is None
+
+    def test_the_wording_does_not_overclaim(self):
+        # An observation on one machine that has also been seen to behave
+        # otherwise; "observed" is what the evidence supports.
+        msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
+        assert "observed" in msg
+
+    def test_warns_on_a_framework_build(self):
+        assert menubar.framework_build_warning("Python", "uv", "26.6.2") is not None
+
+    def test_the_version_is_not_the_gate(self):
+        # A framework build warns whatever the version; a non-framework one
+        # never does. Keying on version_info was the original mistake here.
+        assert menubar.framework_build_warning("Python", None, "26.6.2") is not None
+        assert menubar.framework_build_warning("", None, "26.6.2") is None
+
+    def test_uv_gets_a_uv_remedy(self):
+        msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
+        assert "--managed-python" in msg
+
+    def test_pipx_is_not_handed_a_uv_command(self):
+        # `uv tool install --force` would overwrite pipx's own executable.
+        msg = menubar.framework_build_warning("Python", "pipx", "26.6.2")
+        assert "uv tool install" not in msg
+        assert "pipx install" in msg
+
+    def test_unknown_install_method_still_says_what_to_aim_for(self):
+        msg = menubar.framework_build_warning("Python", None, "26.6.2")
+        assert "non-framework" in msg
+
+    def test_the_warning_names_the_silence(self):
+        # The symptom is that everything looks healthy, so say so.
+        msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
+        assert "logs nothing" in msg
+
+
+# --- engine errors must not vanish -------------------------------------------
+#
+# The hosted auto-switch engine reports a failed tick as an ErrorEvent. The
+# menu bar dropped those: nothing in the log, nothing on screen. Field case —
+# every tick's switch raised "Current account credential is empty" for two
+# days while the icon sat there looking healthy.
+
+
+def test_engine_error_is_surfaced_the_first_time():
+    ev = ErrorEvent(message="Current account credential is empty")
+    assert should_surface_engine_error(ev, {}, now=1000.0) is True
+
+
+def test_engine_error_repeating_every_tick_is_not_a_notification_storm():
+    ev = ErrorEvent(message="Current account credential is empty")
+    seen: dict = {}
+    assert should_surface_engine_error(ev, seen, now=1000.0) is True
+    assert should_surface_engine_error(ev, seen, now=1060.0) is False
+
+
+def test_engine_error_resurfaces_after_the_quiet_period():
+    ev = ErrorEvent(message="Current account credential is empty")
+    seen: dict = {}
+    should_surface_engine_error(ev, seen, now=1000.0)
+    assert should_surface_engine_error(ev, seen, now=1000.0 + ENGINE_ERROR_REPEAT_S) is True
+
+
+def test_two_alternating_engine_errors_are_each_limited():
+    a = ErrorEvent(message="Current account credential is empty")
+    b = ErrorEvent(message="Claude config file not found")
+    seen: dict = {}
+    surfaced = [
+        should_surface_engine_error(ev, seen, now=1000.0 + 60 * i)
+        for i, ev in enumerate([a, b, a, b, a, b])
+    ]
+    assert surfaced == [True, True, False, False, False, False]
+
+
+def test_engine_errors_differing_only_in_numbers_are_one_error():
+    seen: dict = {}
+    first = ErrorEvent(message="LockError: lock held by pid 4242 for 31s")
+    later = ErrorEvent(message="LockError: lock held by pid 4243 for 92s")
+    assert should_surface_engine_error(first, seen, now=1000.0) is True
+    assert should_surface_engine_error(later, seen, now=1060.0) is False
+
+
+def test_engine_error_table_is_pruned():
+    seen: dict = {}
+    for i in range(50):
+        should_surface_engine_error(
+            ErrorEvent(message=f"error kind {chr(65 + i % 26)}{i}"), seen, now=0.0
+        )
+    should_surface_engine_error(ErrorEvent(message="x"), seen, now=ENGINE_ERROR_REPEAT_S)
+    assert list(seen) == ["x"]
+
+
+
+# --- sentinel rows: the state, not the remedy ---------------------------------
+
+
+def test_menu_note_keeps_the_state_and_drops_the_remedy():
+    from claude_swap.switcher import USAGE_RELOGIN_REQUIRED
+
+    note = menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    assert "cswap add" in note, "premise: the note carries a remedy"
+    assert menubar.menu_note(note) == "re-login needed"
+
+
+def test_every_sentinel_note_fits_a_menu_row():
+    # A menu is as wide as its widest row; one expired account must not
+    # double it (the 614pt row #171 measured against 314pt for the others).
+    for note in menubar.SENTINEL_NOTES.values():
+        short = menubar.menu_note(note)
+        assert " — " not in short
+        assert len(short) <= menubar.MENU_NOTE_LIMIT
+
+
+def test_menu_note_truncates_an_unknown_long_state_with_an_ellipsis():
+    short = menubar.menu_note("x" * 60)
+    assert short.endswith("…")
+    assert len(short) == menubar.MENU_NOTE_LIMIT
+
+
+def test_menu_note_leaves_a_short_note_alone():
+    assert menubar.menu_note("API key (no quota)") == "API key (no quota)"
+    assert menubar.usage_summary("no credentials") == "no credentials"
+
+
+def test_account_row_shows_the_sentinel_state_not_the_remedy():
+    from claude_swap.switcher import USAGE_RELOGIN_REQUIRED
+
+    label = menubar.format_account_label(
+        2, "b@x.com", menubar.SENTINEL_NOTES[USAGE_RELOGIN_REQUIRED]
+    )
+    assert label.endswith("re-login needed")
+    assert "cswap add" not in label
+
+
+def test_set_tooltip_reaches_the_native_item_and_tolerates_its_absence():
+    class _NSMenuItem:
+        tip = None
+
+        def setToolTip_(self, text):
+            self.tip = text
+
+    class _Item:
+        def __init__(self):
+            self._menuitem = _NSMenuItem()
+
+    item = _Item()
+    menubar._set_tooltip(item, "re-login needed — the full remedy")
+    assert item._menuitem.tip == "re-login needed — the full remedy"
+    menubar._set_tooltip(object(), "ignored")  # no native item behind it: no error
+
+
+# --- health row: auto-switch state + refresh age -------------------------------
+
+
+def test_health_label_off():
+    label, attention = menubar.health_label(
+        auto_enabled=False, engine_running=False, usage_age=90, refresh_interval=60
+    )
+    assert label == "Auto-switch off · usage read 1m ago"
+    assert attention is False
+
+
+def test_health_label_running():
+    label, attention = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=30, refresh_interval=60
+    )
+    assert label == "Auto-switch running · usage read just now"
+    assert attention is False
+
+
+def test_health_label_enabled_but_not_running_needs_attention():
+    # The state that used to look healthy: the toggle on, no engine behind it.
+    label, attention = menubar.health_label(
+        auto_enabled=True, engine_running=False, usage_age=30, refresh_interval=60
+    )
+    assert label.startswith("⚠ Auto-switch stopped, click to restart")
+    assert attention is True
+
+
+def test_health_label_dates_a_stale_reading_and_a_missing_one():
+    label, _ = menubar.health_label(
+        auto_enabled=False, engine_running=False, usage_age=2 * 3600, refresh_interval=60
+    )
+    assert "usage stale, read 2h 0m ago" in label
+    label, _ = menubar.health_label(
+        auto_enabled=False, engine_running=False, usage_age=None, refresh_interval=60
+    )
+    assert label.endswith("no usage reading yet")
+
+
+def test_health_label_stale_threshold_has_a_floor():
+    # Three 30 s display intervals is not stale while the engine polls the
+    # active account every few minutes; the floor is fifteen minutes.
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=600, refresh_interval=30
+    )
+    assert "stale" not in label
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=16 * 60, refresh_interval=30
+    )
+    assert "stale" in label
+    # With a long interval the multiple wins: 3 x 600 s = 30 min.
+    label, _ = menubar.health_label(
+        auto_enabled=True, engine_running=True, usage_age=20 * 60, refresh_interval=600
+    )
+    assert "stale" not in label
+
+
+def _row(num, is_active, fetched_at):
+    return (num, f"a{num}@x.com", is_active, {}, {}, None, False, fetched_at)
+
+
+def test_active_usage_age_dates_the_active_accounts_reading_not_the_snapshot():
+    # A store-only refresh is new; the reading it serves can be hours old.
+    snapshot = {"accounts": [_row(1, False, 1000.0), _row(2, True, 1000.0 - 2.5 * 3600)]}
+    assert menubar.active_usage_age(snapshot, now=1000.0) == 2.5 * 3600
+
+
+def test_active_usage_age_is_none_without_an_active_reading():
+    assert menubar.active_usage_age({"accounts": [_row(1, False, 10.0)]}, now=20.0) is None
+    assert menubar.active_usage_age({"accounts": [_row(1, True, None)]}, now=20.0) is None
+    assert menubar.active_usage_age(dict(menubar.EMPTY_SNAPSHOT), now=20.0) is None
+
+
+@pytest.mark.parametrize(
+    "seconds, text",
+    [(5, "just now"), (120, "2m ago"), (3900, "1h 5m ago"), (90000, "1d 1h ago")],
+)
+def test_age_text(seconds, text):
+    assert menubar._age_text(seconds) == text
+
+
+def test_engine_exit_applies_only_to_the_hosted_engine():
+    old, new = object(), object()
+    assert menubar.engine_exit_applies(old, old) is True
+    # Restart race: the predecessor's thread finishes after the replacement
+    # started; its exit must not clear the replacement.
+    assert menubar.engine_exit_applies(new, old) is False
+    # Already let go through the app's own stop.
+    assert menubar.engine_exit_applies(None, old) is False
+
+
+def test_engine_stopped_event_names_the_error_or_the_plain_end():
+    engine = object()
+    assert menubar.EngineStoppedEvent(engine, "RuntimeError: boom").human() == "RuntimeError: boom"
+    assert menubar.EngineStoppedEvent(engine).human() == "the engine loop ended on its own"
+    assert menubar.EngineStoppedEvent.kind == "engine-stopped"
+
+
+def test_format_title_attention_prefix():
+    settings = menubar.MenuBarSettings()
+    assert menubar.format_title(None, None, settings, attention=True) == "⚠ ⇄"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, settings, attention=True).startswith("⚠ ⇄ ")
+    assert not menubar.format_title("loc@papaya.asia", _USAGE, settings).startswith("⚠")

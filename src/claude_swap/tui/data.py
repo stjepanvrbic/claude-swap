@@ -17,10 +17,10 @@ import io
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable
 
-from claude_swap import printer, usage_store
+from claude_swap import oauth, printer, usage_store
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.snapshot_source import SnapshotSource
 from claude_swap.switcher import SENTINEL_NOTES, last_seen_note
@@ -124,6 +124,27 @@ def reset_text(window: dict | None, now: float) -> str | None:
     return f"resets {format_duration(remaining)}"
 
 
+def reset_clock(window: dict | None, now: float) -> str | None:
+    """Absolute local reset time ("20:39" / "Jul 14 09:00"), if known.
+
+    None once the reset has elapsed — "resets now" needs no clock.
+    """
+    if not isinstance(window, dict):
+        return None
+    resets_at = window.get("resets_at")
+    if not resets_at:
+        return None
+    try:
+        reset_utc = datetime.fromisoformat(str(resets_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if reset_utc.timestamp() - now <= 0:
+        return None
+    return oauth.reset_clock_string(
+        reset_utc, datetime.fromtimestamp(now, tz=timezone.utc)
+    )
+
+
 def window_reset_text(last_good: dict | None, key: str, now: float) -> str | None:
     """`reset_text` for one of the top-level 5h/7d windows."""
     if not isinstance(last_good, dict):
@@ -152,13 +173,6 @@ def format_age(age_s: float | None) -> str | None:
     return f"· {format_duration(age_s)} ago"
 
 
-def refresh_issue(entry: usage_store.UsageEntry) -> str | None:
-    """Short note for stale-on-error display rows."""
-    if not entry.last_error:
-        return None
-    return f"refresh failed: {entry.last_error}"
-
-
 def clock_stamp() -> str:
     """HH:MM:SS local-time stamp for the event log."""
     return time.strftime("%H:%M:%S")
@@ -170,7 +184,7 @@ __all__ = [
     "format_age",
     "format_duration",
     "last_seen_note",
-    "refresh_issue",
+    "reset_clock",
     "reset_text",
     "run_action",
     "sentinel_label",

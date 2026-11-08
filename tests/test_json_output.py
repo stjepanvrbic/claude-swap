@@ -13,6 +13,9 @@ from claude_swap import oauth
 from claude_swap.exceptions import ConfigError, SwitchError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
+    USAGE_NO_CREDENTIALS,
+    USAGE_TOKEN_EXPIRED,
+    account_row,
     error_envelope,
     usage_fields,
     usage_to_json,
@@ -97,10 +100,50 @@ class TestJsonHelpers:
         assert out["spend"]["countdown"] == countdown
         assert out["spend"]["clock"] == clock
 
+    def test_usage_to_json_adds_pace_fields_when_fetched_at_given(self):
+        # 1 day elapsed of the week, 50% used -> far ahead of the ~14% expected.
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)).isoformat()
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at}}
+        out = usage_to_json(usage, fetched_at=now)
+        assert out["sevenDay"]["aheadOfPace"] is True
+        assert out["sevenDay"]["expectedPct"] == pytest.approx(14.3, abs=0.1)
+        assert "projectedExhaustionAt" in out["sevenDay"]
+        assert out["sevenDay"]["willLastToReset"] is False  # 50% after 1/7 of the week won't last
+
+    def test_usage_to_json_pace_fields_on_scoped_windows(self):
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=6)).isoformat()
+        usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": resets_at}]}
+        out = usage_to_json(usage, fetched_at=now)
+        assert out["scoped"][0]["aheadOfPace"] is True
+
+    def test_usage_to_json_five_hour_never_gets_pace_fields(self):
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(hours=4)).isoformat()
+        usage = {"five_hour": {"pct": 90.0, "resets_at": resets_at}}
+        out = usage_to_json(usage, fetched_at=now)
+        assert "aheadOfPace" not in out["fiveHour"]
+        assert "expectedPct" not in out["fiveHour"]
+
+    def test_usage_to_json_no_pace_fields_without_fetched_at(self):
+        usage = {"seven_day": {"pct": 50.0, "resets_at":
+                                (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()}}
+        out = usage_to_json(usage)
+        assert "aheadOfPace" not in out["sevenDay"]
+
+    def test_usage_to_json_no_pace_fields_within_suppression_window(self):
+        now = 1_700_000_000.0
+        resets_at = (datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(days=7, hours=-1)).isoformat()
+        usage = {"seven_day": {"pct": 50.0, "resets_at": resets_at}}
+        out = usage_to_json(usage, fetched_at=now)
+        assert "aheadOfPace" not in out["sevenDay"]
+
     def test_usage_fields_variants(self):
         from claude_swap.json_output import (
             USAGE_KEYCHAIN_UNAVAILABLE,
             USAGE_NO_CREDENTIALS,
+            USAGE_RELOGIN_REQUIRED,
             USAGE_TOKEN_EXPIRED,
         )
 
@@ -110,6 +153,7 @@ class TestJsonHelpers:
         assert usage_fields("no credentials") == ("no_credentials", None)
         assert usage_fields(USAGE_TOKEN_EXPIRED) == ("token_expired", None)
         assert usage_fields(USAGE_KEYCHAIN_UNAVAILABLE) == ("keychain_unavailable", None)
+        assert usage_fields(USAGE_RELOGIN_REQUIRED) == ("relogin_required", None)
         assert usage_fields(None) == ("unavailable", None)
 
     def test_error_envelope_shape(self):
@@ -118,6 +162,31 @@ class TestJsonHelpers:
             "schemaVersion": SCHEMA_VERSION,
             "error": {"type": "SwitchError", "message": "boom"},
         }
+
+    def test_account_row_includes_alias_when_set(self):
+        from claude_swap.json_output import account_row
+
+        row = account_row(1, "a@x.com", "", "", True, None, alias="dev")
+        assert row["alias"] == "dev"
+
+    def test_account_row_omits_alias_when_unset(self):
+        from claude_swap.json_output import account_row
+
+        row = account_row(1, "a@x.com", "", "", True, None)
+        assert "alias" not in row
+
+    def test_account_row_includes_login_expiry_when_known(self):
+        from claude_swap.json_output import account_row
+
+        row = account_row(
+            1, "a@x.com", "", "", True, None, login_expires_at="2026-10-08T01:06:36Z"
+        )
+        assert row["loginExpiresAt"] == "2026-10-08T01:06:36Z"
+
+    def test_account_row_omits_login_expiry_when_unknown(self):
+        from claude_swap.json_output import account_row
+
+        assert "loginExpiresAt" not in account_row(1, "a@x.com", "", "", True, None)
 
 
 # --------------------------------------------------------------------------- #
@@ -168,6 +237,54 @@ class TestListJson:
         assert acct1["active"] is True
         assert acct1["usageStatus"] == "ok"
         assert acct1["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
+
+    def test_list_payload_includes_alias(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["1"]["alias"] = "dev"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=""), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert by_num[1]["alias"] == "dev"
+        assert "alias" not in by_num[2]
+
+    def test_list_payload_reports_login_expiry_from_the_stored_credential(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        """``loginExpiresAt`` comes from ``refreshTokenExpiresAt`` on each slot's own
+        credential, and is absent for a login that never recorded one."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        backup_creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-backup", "refreshTokenExpiresAt": 1791421596865,
+        }})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            payload = switcher.list_accounts(json_output=True)
+
+        by_num = {a["number"]: a for a in payload["accounts"]}
+        assert "loginExpiresAt" not in by_num[1]
+        assert by_num[2]["loginExpiresAt"] == "2026-10-08T01:06:36Z"
 
     def test_usage_status_no_credentials_and_unavailable(
         self, temp_home: Path, mock_claude_config: Path,
@@ -241,9 +358,16 @@ class TestListJson:
         if expected_status == "ok":
             assert row["usage"]["fiveHour"]["pct"] == 25.0
             assert row["usageAgeSeconds"] >= age_s
+            assert "lastGoodUsage" not in row
         else:
             assert row["usage"] is None
             assert "usageFetchedAt" not in row
+            assert row["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
+            assert row["lastGoodAgeSeconds"] >= age_s
+            assert row["lastGoodFetchedAt"].endswith("Z")
+            # The failed refetch is why the row is unavailable, so it says so.
+            assert row["usageError"] == "timeout"
+            assert row["usageRetryAt"].endswith("Z")
 
 
 # --------------------------------------------------------------------------- #
@@ -288,6 +412,60 @@ class TestStatusJson:
         assert active["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
         assert payload["totalManagedAccounts"] == 2
 
+    def test_status_managed_includes_display_grade_last_good(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        import time as time_mod
+
+        from claude_swap.usage_store import UsageEntry
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+        fetched_at = time_mod.time() - 4000
+        entry = UsageEntry(
+            last_good={"five_hour": {"pct": 25.0}},
+            fetched_at=fetched_at,
+            age_s=4000.0,
+            last_error="http-429",
+            backoff_until=time_mod.time() + 3600,
+        )
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch.object(switcher, "_active_account_usage", return_value=(entry, None)):
+            payload = switcher.status(json_output=True)
+
+        active = payload["active"]
+        assert active["usageStatus"] == "unavailable"
+        assert active["usage"] is None
+        assert active["lastGoodUsage"]["fiveHour"]["pct"] == 25.0
+        assert active["lastGoodAgeSeconds"] == 4000.0
+        assert active["usageError"] == "http-429"
+        assert active["usageRetryAt"].endswith("Z")
+
+    def test_status_managed_includes_alias(
+        self, temp_home: Path, mock_claude_config: Path,
+        sample_sequence_data: dict,
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["1"]["alias"] = "dev"
+        active_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(active_creds, False)), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)):
+            payload = switcher.status(json_output=True)
+
+        assert payload["active"]["alias"] == "dev"
+
 
 # --------------------------------------------------------------------------- #
 # --switch / --switch-to --json
@@ -323,7 +501,12 @@ def _two_account_stores(temp_home: Path, sample_sequence_data: dict):
 def _install_patches(switcher, creds_store, configs_store, live_state):
     patches = [
         patch.object(switcher, "_read_account_credentials",
-                     side_effect=lambda n, e: creds_store.get((str(n), e), "")),
+                     side_effect=lambda n, e, **_kw: creds_store.get((str(n), e), "")),
+        # The strict reader must answer from the same double: a caller that
+        # asks absent-vs-unreadable would otherwise bypass it entirely and
+        # read the real (empty) store.
+        patch.object(switcher, "_read_account_credentials_ex",
+                     side_effect=lambda n, e, **_kw: (creds_store.get((str(n), e), ""), False)),
         patch.object(switcher, "_write_account_credentials",
                      side_effect=lambda n, e, c: creds_store.__setitem__((str(n), e), c)),
         patch.object(switcher, "_read_account_config",
@@ -520,3 +703,159 @@ class TestSwitchJson:
         assert result["switched"] is False
         assert result["reason"] == "unmanaged-account"
         assert result["from"] == {"number": None, "email": "test@example.com"}
+
+
+class TestAccountRowFailure:
+    """The additive ``usageError``/``usageRetryAt`` fields on --list rows."""
+
+    def test_unavailable_row_names_its_failure_and_retry(self):
+        row = account_row(
+            2, "b@example.com", "", "", False, None,
+            last_error="http-429", backoff_until=1_800_000_000.0,
+        )
+        assert row["usageStatus"] == "unavailable"
+        assert row["usageError"] == "http-429"
+        assert row["usageRetryAt"] == "2027-01-15T08:00:00Z"
+
+    def test_lapsed_backoff_leaves_only_the_error(self):
+        row = account_row(2, "b@example.com", "", "", False, None, last_error="timeout")
+        assert row["usageError"] == "timeout"
+        assert "usageRetryAt" not in row
+
+    def test_no_failure_adds_nothing(self):
+        row = account_row(2, "b@example.com", "", "", False, None)
+        assert "usageError" not in row
+        assert "usageRetryAt" not in row
+
+    @pytest.mark.parametrize(
+        "entry", [{"five_hour": {"pct": 5.0}}, USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS]
+    )
+    def test_explained_rows_do_not_repeat_an_old_failure(self, entry):
+        """A served measurement or a sentinel already says what the row is;
+        a failure left over from an earlier pass would only contradict it."""
+        row = account_row(
+            2, "b@example.com", "", "", False, entry,
+            usage_fetched_at=1_800_000_000.0,
+            last_error="http-429", backoff_until=1_800_000_000.0,
+        )
+        assert "usageError" not in row
+        assert "usageRetryAt" not in row
+
+
+class TestAccountRowDisabled:
+    """The additive ``disabled`` field on --list rows."""
+
+    def test_disabled_true_included(self):
+        row = account_row(2, "b@example.com", "", "", False, None, disabled=True)
+        assert row["disabled"] is True
+
+    def test_disabled_absent_by_default(self):
+        row = account_row(1, "a@example.com", "", "", False, None)
+        assert "disabled" not in row
+
+
+class TestUsageFromJson:
+    """``list --json`` usage read back into the internal dict (import-usage)."""
+
+    INTERNAL = {
+        "five_hour": {"pct": 12.0, "resets_at": "2099-01-01T05:00:00+00:00"},
+        "seven_day": {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
+        "spend": {"used": 5.0, "limit": 50.0, "pct": 10.0, "currency": "USD",
+                  "resets_at": "2099-02-01T00:00:00+00:00"},
+        "scoped": [{"name": "Fable", "pct": 30.0,
+                    "resets_at": "2099-01-07T00:00:00+00:00"}],
+    }
+
+    def test_round_trips_what_the_api_measured(self):
+        import time
+
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        back = usage_from_json(usage_to_json(self.INTERNAL, fetched_at=time.time()))
+        # Pace fields are dropped; countdown/clock are rebuilt from resets_at,
+        # the way a fresh fetch writes them.
+        windows = (back["five_hour"], back["seven_day"], back["spend"], back["scoped"][0])
+        for window in windows:
+            assert window.pop("countdown") and window.pop("clock")
+        assert back == self.INTERNAL
+
+    def test_header_probe_reading_keeps_its_source_and_rejection(self):
+        """An imported setup-token reading must still read as partial or
+        refused on the other machine, not as a healthy endpoint reading."""
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {
+            "five_hour": {"pct": 5.0},
+            "rejected": {"retry_after_s": 60.0,
+                         "resets_at": "2099-01-01T05:00:00+00:00"},
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+        exported = usage_to_json(internal)
+        assert exported["source"] == "headers"
+        assert exported["rejected"] == {
+            "retryAfterS": 60.0, "resetsAt": "2099-01-01T05:00:00+00:00",
+        }
+        back = usage_from_json(exported)
+        back["five_hour"].pop("countdown", None)
+        back["five_hour"].pop("clock", None)
+        assert back == internal
+        assert oauth.account_headroom(back) == 0.0
+        partial = usage_from_json({"fiveHour": {"pct": 5}, "source": "headers"})
+        assert oauth.account_headroom(partial) is None
+
+    def test_a_window_without_a_reset_keeps_its_pct(self):
+        from claude_swap.json_output import usage_from_json
+
+        assert usage_from_json({"fiveHour": {"pct": 3}}) == {"five_hour": {"pct": 3.0}}
+
+    @pytest.mark.parametrize("window, key, other", [
+        ("five_hour", "fiveHour", "seven_day"), ("seven_day", "sevenDay", "five_hour"),
+    ])
+    @pytest.mark.parametrize("resets_at", [None, "2099-01-01T05:00:00+00:00"])
+    def test_a_window_without_a_figure_round_trips(self, window, key, other, resets_at):
+        # ``list --json`` emits ``"pct": null`` for a window reported without a
+        # utilization figure; ``cswap import-usage`` must read that document back.
+        import time
+
+        from claude_swap.json_output import usage_from_json, usage_to_json
+
+        internal = {
+            window: {"pct": None},
+            other: {"pct": 40.0, "resets_at": "2099-01-07T00:00:00+00:00"},
+        }
+        if resets_at:
+            internal[window]["resets_at"] = resets_at
+        exported = usage_to_json(internal, fetched_at=time.time())
+        assert exported[key]["pct"] is None
+        back = usage_from_json(exported)
+        for entry in back.values():
+            entry.pop("countdown", None)
+            entry.pop("clock", None)
+        assert back == internal
+
+    @pytest.mark.parametrize("usage", [
+        None,
+        {},
+        {"fiveHour": {"pct": "12"}},
+        {"fiveHour": {"pct": -1}},
+        {"fiveHour": {"pct": float("nan")}},
+        {"fiveHour": {"pct": True}},
+        {"fiveHour": {}},
+        {"fiveHour": {"pct": None, "resetsAt": "next tuesday"}},
+        {"spend": {"pct": None, "used": 1, "limit": 2, "currency": "USD"}},
+        {"scoped": [{"name": "Fable", "pct": None}]},
+        # a header probe never reports a window without a figure
+        {"fiveHour": {"pct": None}, "sevenDay": {"pct": 5}, "source": "headers"},
+        {"sevenDay": {"pct": 1, "resetsAt": "next tuesday"}},
+        {"spend": {"pct": 1, "used": 1, "currency": "USD"}},
+        {"scoped": [{"pct": 1}]},
+        {"scoped": {"name": "Fable", "pct": 1}},
+        {"source": "headers"},
+        {"rejected": "yes"},
+        {"rejected": {"retryAfterS": "30"}},
+    ])
+    def test_malformed_usage_is_refused(self, usage):
+        from claude_swap.json_output import usage_from_json
+
+        with pytest.raises(ValueError):
+            usage_from_json(usage)
