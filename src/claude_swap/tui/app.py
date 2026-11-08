@@ -67,7 +67,7 @@ class CswapApp(App):
         # own fetch lane or usage would freeze at whatever the store holds.
         try:
             bg = background.status(switcher.backup_dir)
-            self._store_only = bg.running and not getattr(bg, "paused", False)
+            self._store_only = bg.running and not bg.paused
         except Exception:
             self._store_only = False
         self._full_next = False
@@ -77,19 +77,17 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
-        # Auto-switch limits, drawn as ticks on the corresponding usage bars.
+        # The auto-switch lines, drawn as ticks on the status strip's bars
+        # everywhere: the threshold on the 5h row, the weekly line (when
+        # set) on the 7d and per-model rows. Missing/invalid settings fall
+        # back to the default.
         try:
-            settings = load_settings(switcher.backup_dir)
-            self.thresholds = {
-                "5h": settings.five_hour_threshold,
-                "7d": settings.seven_day_threshold,
-                "fable": settings.fable_threshold,
-            }
+            loaded = load_settings(switcher.backup_dir)
+            self.threshold_pct: float | None = loaded.threshold
+            self.weekly_threshold_pct: float | None = loaded.weekly_threshold
         except Exception:
-            self.thresholds = {"5h": 95.0, "7d": 98.0, "fable": 98.0}
-        # Kept for the auto screen's session adjustment and third-party
-        # widgets that read the old single value.
-        self.threshold_pct = self.thresholds["5h"]
+            self.threshold_pct = None
+            self.weekly_threshold_pct = None
         try:
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
         except Exception:
@@ -166,6 +164,8 @@ class CswapApp(App):
     ) -> None:
         snap = self.source.take(full=full, store_only=store_only)
         self.call_from_thread(self._apply_snapshot, generation, lane, snap)
+        if self._store_only:
+            self.source.refresh_plans()
 
     def _apply_snapshot(
         self, generation: int, lane: str, snap: AccountsSnapshot

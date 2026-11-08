@@ -3,18 +3,17 @@
 Runs :class:`AutoSwitchEngine` in a thread worker and renders its typed
 events. Opens in **dry-run** — opening a view must never start switching
 accounts on its own; going live is an explicit, confirmed action. The
-engine's own state file semantics (shared quarantine list and state
+engine's own state file semantics (shared cooldown, quarantine list, state
 lock) make it safe to run alongside an external ``cswap auto``.
 
 The active account's full card sits on top (same widget as the dashboard's
-panel, with per-window threshold ticks); this screen adds the engine badge, the
+panel, with the threshold tick); this screen adds the engine badge, the
 ranked switch candidates, and the decision log. While it is up, the app's
 snapshot poller runs store-only: the engine is the only fetcher.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -25,19 +24,19 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     AutoSwitchEngine,
     AutoSwitchEvent,
-    _policy_candidate_key,
     pct_label,
 )
-from claude_swap.models import AccountsSnapshot
-from claude_swap.poll_policy import binding_pct
+from claude_swap.lines import binding_window
+from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
 from claude_swap.tui.modals import ConfirmModal
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import AccountsPanel
+from claude_swap.tui.widgets import AccountsPanel, fit_login, login_segment
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
@@ -104,17 +103,15 @@ class AutoScreen(Screen):
     def on_mount(self) -> None:
         self.app.set_store_only(True)
         self._settings = load_settings(self.app.switcher.backup_dir)
-        # The bar ticks everywhere read app.thresholds, loaded once at app
-        # startup — resync them to the fresh file values so bars and engine
-        # agree, and remember the 5h trigger: unmount restores it (only the
-        # session adjustment reverts, not this correction).
-        self._configured_threshold = self._settings.five_hour_threshold
-        self.app.thresholds = {
-            "5h": self._settings.five_hour_threshold,
-            "7d": self._settings.seven_day_threshold,
-            "fable": self._settings.fable_threshold,
-        }
-        self.app.threshold_pct = self._settings.five_hour_threshold
+        # The bar tick everywhere reads app.threshold_pct, loaded once at app
+        # startup — sync it to the fresh file value so bars and engine agree,
+        # and remember that value: unmount restores it (only the session
+        # adjustment reverts, not this correction).
+        self._configured_threshold = self._settings.threshold
+        self.app.threshold_pct = self._settings.threshold
+        # The weekly line is not session-adjustable, so this is only the same
+        # sync-to-the-file correction; nothing to restore on unmount.
+        self.app.weekly_threshold_pct = self._settings.weekly_threshold
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
@@ -127,7 +124,6 @@ class AutoScreen(Screen):
         # the poll planner and put the bar tick back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
         if self._configured_threshold is not None:
-            self.app.thresholds["5h"] = self._configured_threshold
             self.app.threshold_pct = self._configured_threshold
         self.app.set_store_only(False)
 
@@ -156,7 +152,7 @@ class AutoScreen(Screen):
             self._end_adjust()
             return
         self._adjusting = True
-        self._entry_threshold = self._settings.five_hour_threshold
+        self._entry_threshold = self._settings.threshold
         self._update_summary()
         self.refresh_bindings()
 
@@ -167,60 +163,55 @@ class AutoScreen(Screen):
     def action_threshold_step(self, delta: float) -> None:
         if not self._adjusting:
             return
-        # ``autoswitch.threshold`` owns the shared 50–99.9 band every window
-        # limit is clamped to; the value being steered is the 5h trigger.
         spec = SETTING_SPECS["autoswitch.threshold"]
-        value = min(spec.hi, max(spec.lo, self._settings.five_hour_threshold + delta))
+        value = min(spec.hi, max(spec.lo, self._settings.threshold + delta))
         self._set_threshold(value)
 
     def _end_adjust(self) -> None:
         self._adjusting = False
         self._update_summary()
         self.refresh_bindings()
-        if self._settings.five_hour_threshold == self._entry_threshold:
+        if self._settings.threshold == self._entry_threshold:
             return  # no net change: nothing to announce, no tick to force
         if self._engine is not None:
             self._engine.wake()  # show a decision at the new value now
         self.query_one("#event-log", RichLog).write(
             Text(
-                f"— 5h limit set to {pct_label(self._settings.five_hour_threshold)}% "
+                f"— threshold set to {pct_label(self._settings.threshold)}% "
                 "for this session —",
                 style=Palette.from_theme(self.app.current_theme).muted,
             )
         )
 
     def _set_threshold(self, value: float) -> None:
-        if value == self._settings.five_hour_threshold:
+        if value == self._settings.threshold:
             return
-        # ``threshold`` moves with it: it feeds the engine's poll-policy
-        # escalation band, while ``five_hour_threshold`` is the limit the
-        # switch decision actually triggers on.
-        self._settings = replace(
-            self._settings, threshold=value, five_hour_threshold=value
-        )
+        self._settings = replace(self._settings, threshold=value)
         if self._engine is not None:
             self._engine.apply_threshold(value)
-        self.app.thresholds["5h"] = value
         self.app.threshold_pct = value
         self.query_one("#auto-active-panel", AccountsPanel).refresh()
         self._update_summary()
+        # The Next best list ranks by the lines in force, so it must follow
+        # the session value now rather than at the next snapshot: under a
+        # weekly line the order and the 5h rows' "(line N%)" both move.
+        self._on_snapshot(self.app.snapshot)
 
     def _update_summary(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
-        s = self._settings
         text = Text()
         text.append("auto-switch · ")
         text.append(
-            f"5h {pct_label(s.five_hour_threshold)}%",
+            f"threshold {pct_label(self._settings.threshold)}%",
             style=palette.accent if self._adjusting else "",
         )
-        if s.five_hour_threshold != self._configured_threshold:
+        if self._settings.threshold != self._configured_threshold:
             text.append(" (session)", style=palette.muted)
-        text.append(
-            f" · 7d {pct_label(s.seven_day_threshold)}%"
-            f" · Fable {pct_label(s.fable_threshold)}%"
-            f" · poll every {s.interval_seconds:.0f}s"
-        )
+        if self._settings.weekly_threshold is not None:
+            text.append(
+                f" · weekly {pct_label(self._settings.weekly_threshold)}%"
+            )
+        text.append(f" · poll every {self._settings.interval_seconds:.0f}s")
         if self._adjusting:
             text.append("   ← → adjust · enter done", style=palette.muted)
         self.query_one("#auto-summary", Static).update(text)
@@ -275,7 +266,7 @@ class AutoScreen(Screen):
             self.app.push_screen(
                 ConfirmModal(
                     "Go live? claude-swap will switch your active account "
-                    "automatically when any configured quota threshold is reached.\n\n"
+                    "automatically when the threshold is reached.\n\n"
                     "(Same behavior as running `cswap auto` in a terminal.)",
                     title="Go live",
                     yes_label="Go live",
@@ -315,47 +306,75 @@ class AutoScreen(Screen):
     def _candidates_text(
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
-        """Switch targets ranked the way the engine picks them.
-
-        Same window set as the engine (autoswitch.model included), so the
-        displayed ranking can never disagree with the account it picks:
-        Fable-first among eligible accounts, then the 5h/7d fallback.
-        """
+        """Switch targets ranked by headroom against their own switch lines
+        (best first) — the engine's own ordering."""
+        # Same window set AND the same lines as the engine: autoswitch.model,
+        # each account's own line (its policy threshold, else the session
+        # threshold — `_settings` is what `_set_threshold` replaces), the
+        # weekly line, and the session threshold as the ruler every account is
+        # scored on, so the displayed ranking can never disagree with the
+        # account it picks.
         palette = Palette.from_theme(self.app.current_theme)
-        models = parse_model_names(self._settings.model) if self._settings else ()
-        ranked: list[tuple[tuple[int, int, float, int], str]] = []
-        lines: dict[str, Text] = {}
-        settings = self._settings or load_settings(self.app.switcher.backup_dir)
-        for acc in snap.accounts:
-            if acc.number == active_number or not acc.switchable:
-                continue
-            pct = binding_pct(acc.usage.last_good, models)
-            entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
-            entry.append(acc.email, style=palette.foreground)
+        settings = self._settings
+        models = parse_model_names(settings.model) if settings else ()
+        threshold = settings.threshold if settings else 90.0
+        weekly = settings.weekly_threshold if settings else None
+        candidates = [
+            acc for acc in snap.accounts
+            if acc.number != active_number and acc.switchable
+        ]
+        ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
+        lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, name, the rest)
+        for acc in candidates:
+            line = (
+                acc.policy.threshold if acc.policy.threshold is not None else threshold
+            )
+            binding = binding_window(
+                oauth.relevant_windows(acc.usage.last_good, models),
+                line,
+                weekly,
+                scale=threshold,
+            )
+            head, entry = Text(), Text()
+            head.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
+            head.append(acc.email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append(((2, 2, float("inf"), int(acc.number)), acc.number))
-            elif pct is None:
+                ranked.append((998.0, acc.number))
+            elif binding is None:
                 entry.append("  usage unknown", style=palette.muted)
-                ranked.append(((2, 2, float("inf"), int(acc.number)), acc.number))
+                ranked.append((999.0, acc.number))
             else:
-                entry.append(f"  {pct:3.0f}% used", style=palette.severity(pct))
-                key = _policy_candidate_key(
-                    acc.usage.last_good, settings, time.time(), acc.number
+                # The raw pct of the window that binds, and — only once the
+                # lines differ, globally or for this account — the line it is
+                # judged against.
+                entry.append(
+                    f"  {binding.label} {binding.pct:3.0f}% used",
+                    style=palette.severity(binding.pct),
                 )
-                ranked.append(
-                    (key or (2, 2, float("inf"), int(acc.number)), acc.number)
-                )
-            lines[acc.number] = entry
+                if weekly is not None or acc.policy.threshold is not None:
+                    entry.append(
+                        f" (line {pct_label(binding.line)}%)", style=palette.muted
+                    )
+                ranked.append((-binding.line_headroom, acc.number))
+            lines[acc.number] = (acc, head, entry)
 
         text = Text()
         text.append("Next best", style=palette.muted)
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        for _key, number in sorted(ranked):
-            text.append(lines[number])
+        order = [lines[number] for _pct, number in sorted(ranked)]
+        # The box has no width before its first layout; its CSS padding is 2 a side.
+        budget = self.query_one("#candidates", Static).size.width or self.app.size.width - 4
+        for row in fit_login(
+            lambda login: [
+                Text.assemble(head, tail, Text(login_segment(acc, login), style=palette.muted))
+                for acc, head, tail in order
+            ],
+            budget,
+        ):
+            text.append(row)
         return text

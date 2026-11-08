@@ -1,7 +1,20 @@
-"""Detached auto-switch worker management."""
+"""Detached auto-switch worker management.
+
+``start``/``stop``/``pause``/``resume``/``status`` manage one worker process
+per backup root (``cswap auto start`` launches ``cswap auto _worker``
+detached), recorded in a pid file. The worker writes its events through
+:func:`event_logger`, a size-rotated log, and anything it prints to stderr
+(a crash traceback) lands in a separate file.
+
+    st = start(backup_root)       # BackgroundStatus(running=True, pid=...)
+    emit = event_logger(backup_root)
+    emit(event)                   # one timestamped line per engine event
+"""
 
 from __future__ import annotations
 
+import logging
+import logging.handlers
 import os
 import signal
 import subprocess
@@ -14,6 +27,12 @@ from claude_swap.settings import load_settings, set_setting
 
 PID_FILENAME = "autoswitch_background.pid"
 LOG_FILENAME = "autoswitch_background.log"
+STDERR_FILENAME = "autoswitch_background.err"
+# A poll line every tick is ~2 MB a day at the 15 s minimum interval, so
+# this keeps roughly a week of history.
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUPS = 3
+STDERR_MAX_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -42,6 +61,39 @@ def pid_path(backup_root: Path) -> Path:
 
 def log_path(backup_root: Path) -> Path:
     return backup_root / LOG_FILENAME
+
+
+def stderr_path(backup_root: Path) -> Path:
+    return backup_root / STDERR_FILENAME
+
+
+class EventLog:
+    """Engine-event sink for the worker: one timestamped line per event in
+    the rotated worker log."""
+
+    def __init__(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS,
+            encoding="utf-8",
+        )
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s  %(message)s", "%Y-%m-%d %H:%M:%S")
+        )
+        self._logger = logging.getLogger(f"claude-swap-worker.{path}")
+        self._logger.handlers[:] = [handler]
+        self._logger.setLevel(logging.INFO)
+        self._logger.propagate = False
+
+    def __call__(self, event) -> None:
+        self.write(event.human())
+
+    def write(self, line: str) -> None:
+        self._logger.info(line)
+
+
+def event_logger(backup_root: Path) -> EventLog:
+    return EventLog(log_path(backup_root))
 
 
 def _read_pid(path: Path) -> int | None:
@@ -120,8 +172,12 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
         return status(backup_root)
     _remove_pid(current.pid_path)
 
-    log = log_path(backup_root)
-    log.parent.mkdir(parents=True, exist_ok=True)
+    err = stderr_path(backup_root)
+    err.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        err_mode = "wb" if err.stat().st_size > STDERR_MAX_BYTES else "ab"
+    except FileNotFoundError:
+        err_mode = "ab"
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     args = [sys.executable, "-m", "claude_swap", "auto", "_worker"]
@@ -140,12 +196,12 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
     else:
         popen_kwargs["start_new_session"] = True
 
-    with open(log, "ab", buffering=0) as log_file:
+    with open(err, err_mode, buffering=0) as err_file:
         proc = subprocess.Popen(
             args,
             stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=log_file,
+            stdout=subprocess.DEVNULL,
+            stderr=err_file,
             close_fds=True,
             creationflags=creationflags,
             env=env,

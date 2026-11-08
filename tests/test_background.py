@@ -94,3 +94,24 @@ def test_resume_restarts_enabled_worker(tmp_path: Path):
     start.assert_called_once_with(tmp_path, debug=False)
     assert st is status
     assert load_settings(tmp_path).paused is False
+
+def test_event_log_rotates_by_size(tmp_path: Path):
+    with patch.object(background, "LOG_MAX_BYTES", 200):
+        emit = background.event_logger(tmp_path)
+        for i in range(20):
+            emit.write(f"line {i:02d} " + "x" * 40)
+    log = tmp_path / background.LOG_FILENAME
+    rotated = sorted(tmp_path.glob(background.LOG_FILENAME + ".*"))
+    assert log.stat().st_size <= 200
+    assert len(rotated) == background.LOG_BACKUPS
+    assert "line 19" in log.read_text()
+
+
+def test_worker_output_goes_to_stderr_file_not_the_event_log(tmp_path: Path):
+    proc = Mock(pid=12345)
+    with patch("claude_swap.background._process_running", return_value=False), \
+         patch("subprocess.Popen", return_value=proc) as popen:
+        background.start(tmp_path)
+    kwargs = popen.call_args.kwargs
+    assert kwargs["stderr"].name == str(tmp_path / background.STDERR_FILENAME)
+    assert kwargs["stdout"] is background.subprocess.DEVNULL
