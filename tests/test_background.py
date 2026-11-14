@@ -6,6 +6,8 @@ import threading
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
+
 from claude_swap import background
 from claude_swap.settings import load_settings, set_setting
 
@@ -162,3 +164,48 @@ def test_stop_reports_stopped_only_once_the_lock_is_free(tmp_path: Path):
     assert st.running is False
     assert st.warnings == ()
     assert not (tmp_path / background.PID_FILENAME).exists()
+
+
+@pytest.mark.parametrize("case", ["pid file already gone", "process already gone"])
+def test_stop_waits_for_the_lock_however_the_worker_is_ending(tmp_path: Path, case):
+    # A worker shutting down drops its pid file before its lock; one that
+    # exited before the signal makes the signal fail.
+    lock = background.worker_lock(tmp_path)
+    assert lock.try_acquire(timeout=1.0)
+    pid_file = tmp_path / background.PID_FILENAME
+    if case == "pid file already gone":
+        pid_file.unlink()
+    else:
+        pid_file.write_text("12345\n")
+    threading.Timer(0.3, lock.release).start()
+    try:
+        with patch("claude_swap.background._process_running", return_value=False), \
+             patch("claude_swap.background.os.kill", side_effect=ProcessLookupError):
+            st = background.stop(tmp_path)
+    finally:
+        lock.release()
+
+    assert st.running is False
+    assert st.warnings == ()
+    assert not pid_file.exists()
+
+
+def test_stop_leaves_the_pid_file_of_a_worker_started_since(tmp_path: Path):
+    lock = background.worker_lock(tmp_path)
+    assert lock.try_acquire(timeout=1.0)
+    pid_file = tmp_path / background.PID_FILENAME
+    pid_file.write_text("12345\n")
+
+    def replaced(*_):
+        # The signalled worker is gone and another one holds the lock now.
+        pid_file.write_text("67890\n")
+
+    try:
+        with patch("claude_swap.background._process_running", side_effect=lambda pid: pid == 67890), \
+             patch("claude_swap.background.os.kill", side_effect=replaced):
+            st = background.stop(tmp_path, timeout=0.5)
+    finally:
+        lock.release()
+
+    assert pid_file.read_text().strip() == "67890"
+    assert st.warnings == ("A worker still holds the auto-switch lock after 0s.",)

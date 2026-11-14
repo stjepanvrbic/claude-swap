@@ -293,7 +293,7 @@ class TestStartUnderAManager:
                 stopped = background.stop(tmp_path, timeout=0.5)
                 # The dead worker's pid goes with it, whatever its lock says.
                 assert not background.pid_path(tmp_path).exists()
-                assert "still holds its lock" in stopped.warnings[0]
+                assert "still holds the auto-switch lock" in stopped.warnings[0]
 
                 threading.Timer(0.5, lock.release).start()
                 with patch.object(background, "wait_for_worker", return_value=True):
