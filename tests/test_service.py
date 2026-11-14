@@ -225,7 +225,9 @@ class TestStartUnderAManager:
         )
         with patch.object(service, "manager", return_value=manager), \
              patch.object(background, "status", return_value=running), \
+             patch.object(background, "worker_lock") as lock, \
              patch.object(background, "_end_worker") as end:
+            lock.return_value.held_elsewhere.return_value = True
             background.start(tmp_path)
 
         end.assert_not_called()
@@ -239,12 +241,43 @@ class TestStartUnderAManager:
         )
         with patch.object(service, "manager", return_value=manager), \
              patch.object(background, "status", return_value=stray), \
-             patch.object(background, "_end_worker") as end, \
+             patch.object(background, "worker_lock") as lock, \
+             patch.object(background, "_end_worker", return_value=True) as end, \
              patch.object(background, "wait_for_worker", return_value=True):
+            lock.return_value.held_elsewhere.return_value = True
             background.start(tmp_path)
 
         end.assert_called_once_with(tmp_path, 4321)
         assert manager.calls == ["install", "activate"]
+
+    def test_a_dead_workers_reused_pid_is_never_signalled(self, tmp_path: Path, no_detached_launch):
+        # status() calls a live pid running; only the lock says it is ours.
+        reused = background.BackgroundStatus(
+            enabled=True, pid=4321, running=True, pid_path=tmp_path / "p",
+            log_path=tmp_path / "l", supervisor=None,
+        )
+        manager = FakeManager()
+        with patch.object(service, "manager", return_value=manager), \
+             patch.object(background, "status", return_value=reused), \
+             patch.object(background, "wait_for_worker", return_value=True), \
+             patch.object(background.os, "kill") as kill:
+            background.start(tmp_path)
+            background.stop(tmp_path)
+
+        kill.assert_not_called()
+        assert manager.calls == ["install", "activate", "deactivate"]
+
+    @pytest.mark.real_service_manager  # the real _run, over a stubbed subprocess.run
+    def test_a_hung_manager_command_still_leaves_a_worker_running(self, tmp_path: Path, no_detached_launch):
+        unit = service.SystemdUser(unit_dir=tmp_path / "user")
+        hung = subprocess.TimeoutExpired(["systemctl"], 30)
+        with patch.object(service, "manager", return_value=unit), \
+             patch.object(service, "worker_argv", return_value=WORKER), \
+             patch.object(service.subprocess, "run", side_effect=hung):
+            st = background.start(tmp_path)
+
+        no_detached_launch.assert_called_once()
+        assert "did not start" in st.warnings[0]
 
     def test_stop_keeps_the_manager_from_starting_it_again(self, tmp_path: Path):
         manager = FakeManager()

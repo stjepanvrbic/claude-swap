@@ -507,9 +507,14 @@ def test_the_service_worker_takes_over_when_a_detached_one_ends(worker_root: Pat
                 proc.wait()
 
 
+# The autouse guard does not reach a child process: without this the
+# child would register and run the machine's real scheduled task.
 _STARTER = (
     "import sys, pathlib\n"
-    "from claude_swap import background\n"
+    "from claude_swap import background, service\n"
+    "def no_manager(_root):\n"
+    "    raise service.Unavailable('')\n"
+    "service.manager = no_manager\n"
     "sys.stdin.readline()\n"
     "background.start(pathlib.Path(sys.argv[1]))\n"
 )

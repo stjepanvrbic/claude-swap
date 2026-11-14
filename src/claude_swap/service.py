@@ -57,17 +57,19 @@ class ServiceError(ClaudeSwitchError):
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        argv, capture_output=True, text=True, timeout=_COMMAND_TIMEOUT_S,
-        stdin=subprocess.DEVNULL,
-    )
+    """Run one service-manager command; :class:`ServiceError` when it cannot
+    run or does not finish."""
+    try:
+        return subprocess.run(
+            argv, capture_output=True, text=True, errors="replace",
+            timeout=_COMMAND_TIMEOUT_S, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ServiceError(f"{' '.join(argv)}: {e}") from e
 
 
 def _checked(argv: list[str]) -> subprocess.CompletedProcess:
-    try:
-        result = _run(argv)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise ServiceError(f"{' '.join(argv)}: {e}") from e
+    result = _run(argv)
     if result.returncode != 0:
         said = (result.stderr or result.stdout or "").strip()
         raise ServiceError(f"{' '.join(argv)} exited {result.returncode}: {said}")
@@ -115,7 +117,7 @@ class SystemdUser:
             f"{environment}"
             "Restart=on-failure\n"
             "RestartSec=10s\n"
-            "TimeoutStopSec=20s\n"
+            "TimeoutStopSec=60s\n"
             "UMask=0077\n"
             "\n"
             "[Install]\n"
@@ -130,10 +132,13 @@ class SystemdUser:
             current = None
         if current == text:
             return
-        self.unit_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, self.path)
+        try:
+            self.unit_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_name(self.path.name + ".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, self.path)
+        except OSError as e:
+            raise ServiceError(f"writing {self.path}: {e}") from e
         _checked(["systemctl", "--user", "daemon-reload"])
 
     def installed(self) -> bool:
@@ -239,9 +244,12 @@ class TaskScheduler:
     def install(self) -> None:
         env = [f"--env={key}={value}" for key, value in sorted(_forwarded_env().items())]
         xml = self.render([*worker_argv(self.name), *env], _windows_account())
-        self.scratch_dir.mkdir(parents=True, exist_ok=True)
         path = self.scratch_dir / "autoswitch_task.xml"
-        path.write_text(xml, encoding="utf-16")
+        try:
+            self.scratch_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(xml, encoding="utf-16")
+        except OSError as e:
+            raise ServiceError(f"writing {path}: {e}") from e
         try:
             _checked(["schtasks", "/Create", "/TN", self.task, "/XML", str(path), "/F"])
         finally:
@@ -283,8 +291,8 @@ def manager(backup_root: Path) -> Manager:
         raise Unavailable("systemctl is not on PATH")
     try:
         probe = _run(["systemctl", "--user", "show", "--property=Version"])
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise Unavailable(f"systemctl --user: {e}") from e
+    except ServiceError as e:
+        raise Unavailable(str(e)) from e
     if probe.returncode != 0:
         said = (probe.stderr or probe.stdout or "").strip()
         raise Unavailable(f"no systemd user manager to talk to ({said})")

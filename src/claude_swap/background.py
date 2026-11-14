@@ -243,14 +243,22 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
                     f"No service manager runs the worker here ({e}): it runs "
                     "detached, and nothing restarts it if it dies."
                 )
-    if current.running:
-        if manager is None or current.supervisor == manager.name:
-            return replace(status(backup_root), warnings=tuple(warnings))
-        # A worker the service manager did not start: it gives way to the
-        # service's, which comes back if it dies.
-        _end_worker(backup_root, current.pid)
+    # The pid file names a worker only while its lock is held: a killed
+    # worker's pid can belong to another process by now.
+    held = worker_lock(backup_root).held_elsewhere()
+    if held and (manager is None or current.supervisor == manager.name):
+        return replace(status(backup_root), warnings=tuple(warnings))
 
     if manager is not None:
+        if held:
+            # A worker the service manager did not start: it gives way to
+            # the service's, which comes back if it dies.
+            if not _end_worker(backup_root, current.pid):
+                warnings.append(
+                    f"The running worker (pid {current.pid}) did not stop within "
+                    f"{HANDOVER_WAIT_S:.0f}s; the service's worker takes over "
+                    "when it ends."
+                )
         try:
             manager.install()
             manager.activate()
@@ -260,7 +268,10 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
                 "detached, and nothing restarts it if it dies."
             )
         else:
-            warnings.extend(manager.warnings())
+            try:
+                warnings.extend(manager.warnings())
+            except service.ServiceError:
+                pass
             if wait_for_worker(backup_root, START_WAIT_S):
                 return replace(status(backup_root), warnings=tuple(warnings))
             warnings.append(
@@ -282,8 +293,8 @@ def wait_for_worker(backup_root: Path, timeout: float) -> bool:
     return True
 
 
-def _end_worker(backup_root: Path, pid: int | None) -> None:
-    """Stop the running worker and wait for its lock to free."""
+def _end_worker(backup_root: Path, pid: int | None) -> bool:
+    """Stop the worker holding the lock; whether its lock freed in time."""
     if pid is not None:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -291,8 +302,11 @@ def _end_worker(backup_root: Path, pid: int | None) -> None:
             pass
     lock = worker_lock(backup_root)
     deadline = time.monotonic() + HANDOVER_WAIT_S
-    while lock.held_elsewhere() and time.monotonic() < deadline:
+    while lock.held_elsewhere():
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.2)
+    return True
 
 
 def _launch_detached(
@@ -371,26 +385,32 @@ def stop(
         manager = service.manager(backup_root)
     except service.Unavailable:
         manager = None
-    if manager is not None and manager.installed():
-        manager.deactivate()
+    warnings: list[str] = []
+    try:
+        if manager is not None and manager.installed():
+            manager.deactivate()
+    except service.ServiceError as e:
+        warnings.append(f"The {manager.describe()} could not be disabled ({e}).")
     current = status(backup_root)
-    if not current.running or current.pid is None:
+    # Only the lock's holder owns the pid file's pid: a killed worker's pid
+    # can belong to another process by now.
+    if current.pid is None or not worker_lock(backup_root).held_elsewhere():
         _remove_pid(current.pid_path)
-        return status(backup_root)
+        return replace(status(backup_root), warnings=tuple(warnings))
 
     try:
         os.kill(current.pid, signal.SIGTERM)
     except OSError:
         _remove_pid(current.pid_path)
-        return status(backup_root)
+        return replace(status(backup_root), warnings=tuple(warnings))
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not _process_running(current.pid):
             _remove_pid(current.pid_path)
-            return status(backup_root)
+            break
         time.sleep(0.1)
-    return status(backup_root)
+    return replace(status(backup_root), warnings=tuple(warnings))
 
 
 def pause(backup_root: Path) -> BackgroundStatus:

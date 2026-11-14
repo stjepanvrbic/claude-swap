@@ -1097,26 +1097,25 @@ def _auto_worker_command(argv: list[str]) -> None:
                     sys.exit(0)
             settings = load_settings(root)
 
-        if args.service:
-            # A service manager keeps no console: a crash traceback goes to
-            # the worker's stderr file, as it does for a detached worker.
-            with background.open_stderr(root) as err:
-                os.dup2(err.fileno(), 2)
-        engine = AutoSwitchEngine(switcher, settings, emit)
-        signal.signal(signal.SIGTERM, lambda *_: engine.stop())
-        weekly = (
-            f", weekly {pct_label(settings.weekly_threshold)}%"
-            if settings.weekly_threshold is not None
-            else ""
-        )
-        emit.write(
-            f"Auto-switch background worker running: threshold "
-            f"{pct_label(settings.threshold)}%{weekly}, strategy "
-            f"{settings.strategy}, every {settings.interval_seconds:.0f}s"
-        )
         try:
             if args.service:
                 background.mark_supervised(root, args.service)
+                # A service manager keeps no console: a crash traceback goes
+                # to the worker's stderr file, as it does for a detached one.
+                with background.open_stderr(root) as err:
+                    os.dup2(err.fileno(), 2)
+            engine = AutoSwitchEngine(switcher, settings, emit)
+            signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+            weekly = (
+                f", weekly {pct_label(settings.weekly_threshold)}%"
+                if settings.weekly_threshold is not None
+                else ""
+            )
+            emit.write(
+                f"Auto-switch background worker running: threshold "
+                f"{pct_label(settings.threshold)}%{weekly}, strategy "
+                f"{settings.strategy}, every {settings.interval_seconds:.0f}s"
+            )
             code = engine.run_loop(
                 settings_loader=lambda: reload_settings(root),
                 should_continue=lambda current: current.enabled,
