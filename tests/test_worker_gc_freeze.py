@@ -59,9 +59,13 @@ def _child_pytest(tmp_path, worker, *opts):
     (tmp_path / "home").mkdir()
     if worker:
         env["PYTEST_XDIST_WORKER"] = "gw0"
+    # A basetemp of its own: under the shared default root the child's
+    # numbered-dir cleanup races the parallel workers', and an unclosed
+    # scandir iterator it leaves becomes an error under -W error.
     done = subprocess.run(
         [sys.executable, "-c", CHILD, "-q", "-p", "no:cacheprovider",
-         "-p", "tests.conftest", f"--rootdir={tmp_path}", str(tmp_path), *opts],
+         "-p", "tests.conftest", f"--rootdir={tmp_path}",
+         f"--basetemp={tmp_path / 'basetemp'}", str(tmp_path), *opts],
         cwd=ROOT, env=env, capture_output=True, text=True,
     )
     return done.returncode, done.stdout.splitlines()[-1], done.stdout + done.stderr
