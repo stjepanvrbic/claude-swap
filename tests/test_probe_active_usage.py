@@ -135,6 +135,41 @@ class TestTryFetch:
         assert outcome.usage["scoped"][0]["name"] == "Fable"
         assert outcome.usage["scoped"][0]["pct"] == 42.0
 
+    def test_an_unanswered_probe_falls_back_to_the_endpoint(self, network):
+        # 529 is the API being overloaded, not the account being spent.
+        network.accounts["sk-1"] = Account(fable=20)
+        network.probe_error = urllib.error.HTTPError(
+            "https://api.anthropic.com/v1/messages", 529, "Overloaded", {}, None
+        )
+
+        outcome = oauth.try_fetch_usage_for_account(
+            "1", "a@example.com", _creds("sk-1"), is_active=True,
+            probe_model=oauth.FABLE_PROBE_MODEL,
+        )
+
+        assert network.endpoint_calls == ["sk-1"]
+        assert outcome.error is None
+        assert outcome.usage["scoped"][0]["pct"] == 20.0
+
+    def test_a_probe_without_the_fable_window_falls_back_to_the_endpoint(
+        self, network, monkeypatch
+    ):
+        network.accounts["sk-1"] = Account(fable=20)
+        monkeypatch.setattr(
+            oauth, "request_usage_via_probe",
+            lambda token, model=None: oauth.parse_unified_ratelimit_headers(
+                network.accounts[token].headers(oauth.USAGE_PROBE_MODEL)
+            ),
+        )
+
+        outcome = oauth.try_fetch_usage_for_account(
+            "1", "a@example.com", _creds("sk-1"), is_active=True,
+            probe_model=oauth.FABLE_PROBE_MODEL,
+        )
+
+        assert network.endpoint_calls == ["sk-1"]
+        assert outcome.usage["scoped"][0]["pct"] == 20.0
+
     def test_another_account_is_read_from_the_endpoint(self, network):
         network.accounts["sk-2"] = Account(fable=10)
 
@@ -250,6 +285,25 @@ class Fleet:
         return [e for e in self.events if isinstance(e, SwitchEvent)]
 
 
+class TestEngineWhileTheProbeFails:
+    def test_a_healthy_account_is_kept_when_only_the_probe_fails(
+        self, temp_home, network
+    ):
+        fleet = Fleet(temp_home)
+        network.probe_error = urllib.error.HTTPError(
+            "https://api.anthropic.com/v1/messages", 529, "Overloaded", {}, None
+        )
+        network.accounts["sk-1"] = Account(fable=20)
+        for n in (2, 3, 4):
+            network.accounts[f"sk-{n}"] = Account(fable=0)
+
+        for _ in range(4):
+            fleet.engine.tick()
+
+        assert fleet.switches() == []
+        assert fleet.active() == 1
+
+
 class TestEngineWhileTheEndpointRefuses:
     """The failure in the field: the endpoint answered 429 for hours, the
     active account's usage was unknown, and nothing switched."""
@@ -309,6 +363,22 @@ def worker_root(tmp_path: Path, monkeypatch):
 
 def _worker() -> list[str]:
     return [sys.executable, "-m", "claude_swap", "auto", "_worker"]
+
+
+def test_start_reports_the_worker_that_holds_the_lock(worker_root: Path):
+    st = background.start(worker_root)
+    lock = background.worker_lock(worker_root)
+    deadline = time.monotonic() + 60
+    while not lock.held_elsewhere() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    holder = int(background.pid_path(worker_root).read_text().strip())
+
+    with patch("subprocess.Popen") as popen:
+        again = background.start(worker_root)
+
+    popen.assert_not_called()
+    assert again.running and again.pid == holder
+    assert st.running
 
 
 def test_only_one_worker_runs_per_backup_root(worker_root: Path):

@@ -753,6 +753,24 @@ class _InvalidUsageResponse(ValueError):
     """A reported window that cannot be read as a measurement (``bad-response``)."""
 
 
+def _probe_reading_covers(usage: dict | None, probe_model: str) -> bool:
+    """Whether a probe reading has the windows it was asked for: the 7-day
+    window always (a refusal alone counts too), and Fable's when the probe
+    asked Fable."""
+    if not isinstance(usage, dict):
+        return False
+    if "rejected" in usage:
+        return True
+    if not isinstance(usage.get("seven_day"), dict):
+        return False
+    if probe_model != FABLE_PROBE_MODEL:
+        return True
+    return any(
+        isinstance(s, dict) and str(s.get("name", "")).lower() == "fable"
+        for s in usage.get("scoped") or ()
+    )
+
+
 def _reported_window(data: dict, key: str) -> dict | None:
     """The raw ``five_hour``/``seven_day`` window, or None when absent.
 
@@ -1164,11 +1182,12 @@ def try_fetch_usage_for_account(
     the ``"setup-token"`` error and no request is sent.
 
     ``probe_model`` reads an OAuth account from the header probe with that
-    model: an active account (``is_active``) only from the probe, since the
-    endpoint's small per-account budget then decides whether the account
-    driving every Claude Code session can be read at all; any other account
-    from the endpoint, and from the probe when the endpoint answers 429.
-    None keeps the endpoint alone.
+    model: an active account (``is_active``) from the probe first, since the
+    endpoint's small per-account budget would otherwise decide whether the
+    account driving every Claude Code session can be read at all, and from
+    the endpoint only when the probe fails or lacks a window; any other
+    account from the endpoint, and from the probe when the endpoint answers
+    429. None keeps the endpoint alone.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -1182,7 +1201,12 @@ def try_fetch_usage_for_account(
         return UsageOutcome(None, error="setup-token")
 
     if is_active and probe_model is not None:
-        return _usage_from_probe(access_token, context, probe_model)
+        probed = _usage_from_probe(access_token, context, probe_model)
+        if probed.error is None and _probe_reading_covers(probed.usage, probe_model):
+            return probed
+        # A probe the server did not answer (overloaded, network) or whose
+        # headers lack a window is no reason to treat the account as
+        # unreadable: the endpoint still may answer.
 
     working_credentials = credentials
 

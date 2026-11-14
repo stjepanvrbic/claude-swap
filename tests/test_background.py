@@ -24,11 +24,11 @@ def test_start_enables_and_launches_worker(tmp_path: Path):
 
     with patch("claude_swap.background._process_running", return_value=False), \
          patch("subprocess.Popen", return_value=proc) as popen:
-        st = background.start(tmp_path)
+        background.start(tmp_path)
 
     assert load_settings(tmp_path).enabled is True
-    assert (tmp_path / background.PID_FILENAME).read_text().strip() == "12345"
-    assert st.pid == 12345
+    # The worker writes its own pid once it holds the lock, not the starter.
+    assert not (tmp_path / background.PID_FILENAME).exists()
     popen.assert_called_once()
     args = popen.call_args.args[0]
     assert args[-3:] == ["claude_swap", "auto", "_worker"]

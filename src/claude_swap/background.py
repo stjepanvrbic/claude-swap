@@ -35,6 +35,8 @@ STDERR_FILENAME = "autoswitch_background.err"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 3
 STDERR_MAX_BYTES = 1024 * 1024
+# How long `start` waits to see the new worker take the lock.
+START_WAIT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -114,13 +116,6 @@ def _read_pid(path: Path) -> int | None:
     except ValueError:
         return None
     return pid if pid > 0 else None
-
-
-def _write_pid(path: Path, pid: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{pid}\n", encoding="utf-8")
-    if sys.platform != "win32":
-        os.chmod(path, 0o600)
 
 
 def _remove_pid(path: Path) -> None:
@@ -215,7 +210,15 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
             env=env,
             **popen_kwargs,
         )
-    _write_pid(current.pid_path, proc.pid)
+    # The worker writes its own pid once it holds the lock: the launched
+    # process may be a launcher (a Windows venv's python.exe), or a duplicate
+    # that leaves at once. Report what happened rather than what was spawned.
+    deadline = time.monotonic() + START_WAIT_S
+    while time.monotonic() < deadline:
+        st = status(backup_root)
+        if worker_lock(backup_root).held_elsewhere() or proc.poll() is not None:
+            return st
+        time.sleep(0.1)
     return status(backup_root)
 
 
