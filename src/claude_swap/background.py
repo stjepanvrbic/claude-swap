@@ -404,9 +404,12 @@ def stop(
         _remove_pid(current.pid_path)
         return replace(status(backup_root), warnings=tuple(warnings))
 
+    # The lock, not the process: Windows reports a terminated process gone
+    # before it closes the process's handles, the lock file's among them.
+    lock = worker_lock(backup_root)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not _process_running(current.pid):
+        if not lock.held_elsewhere():
             _remove_pid(current.pid_path)
             break
         time.sleep(0.1)

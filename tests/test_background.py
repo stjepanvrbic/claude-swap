@@ -142,3 +142,19 @@ def test_worker_output_goes_to_stderr_file_not_the_event_log(tmp_path: Path):
     kwargs = popen.call_args.kwargs
     assert kwargs["stderr"].name == str(tmp_path / background.STDERR_FILENAME)
     assert kwargs["stdout"] is background.subprocess.DEVNULL
+
+
+def test_stop_reports_stopped_only_once_the_lock_is_free(tmp_path: Path):
+    # Windows: the process reads as exited while its lock is still held.
+    (tmp_path / background.PID_FILENAME).write_text("12345\n")
+    lock = Mock()
+    lock.held_elsewhere.side_effect = [True, True, True, False, False]
+
+    with patch("claude_swap.background.worker_lock", return_value=lock), \
+         patch("claude_swap.background._process_running", return_value=False), \
+         patch("claude_swap.background.os.kill") as kill:
+        st = background.stop(tmp_path)
+
+    kill.assert_called_once()
+    assert st.running is False
+    assert not (tmp_path / background.PID_FILENAME).exists()
