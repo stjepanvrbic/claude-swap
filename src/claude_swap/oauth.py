@@ -32,6 +32,9 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 USAGE_PROBE_URL = "https://api.anthropic.com/v1/messages"
 USAGE_PROBE_MODEL = "claude-haiku-5-5"
 USAGE_PROBE_API_VERSION = "2023-06-01"
+# The probe model whose response headers also carry Fable's own weekly
+# window (``7d_oi``); a request to any other model reports only 5h and 7d.
+FABLE_PROBE_MODEL = "claude-fable-5-2"
 # OAuth inference requests are only accepted with Claude Code's system prompt.
 USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 
@@ -552,7 +555,8 @@ USAGE_SOURCE_HEADERS = "headers"
 _UNIFIED_WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
 # Per-model weekly buckets in the unified headers → the model display name the
 # usage API's ``weekly_scoped`` limits use, so ``autoswitch.model`` matches
-# them the same way. ``7d_oi`` is Fable's weekly window.
+# them the same way. ``7d_oi`` is Fable's weekly window, sent only on a
+# response to a Fable request (:data:`FABLE_PROBE_MODEL`).
 _UNIFIED_SCOPED_WINDOWS = (("7d_oi", "Fable"),)
 
 
@@ -567,7 +571,11 @@ def _unified_window(headers, prefix: str) -> tuple[float, str | None] | None:
         return None
     if not math.isfinite(fraction) or fraction < 0:
         return None
-    return round(fraction * 100, 2), _epoch_header_iso(headers.get(f"{base}-reset"))
+    pct = round(fraction * 100, 2)
+    if headers.get(f"{base}-status") == "rejected":
+        # The server refuses this window whatever its utilization rounds to.
+        pct = max(pct, 100.0)
+    return pct, _epoch_header_iso(headers.get(f"{base}-reset"))
 
 
 def _unified_window_present(headers, prefix: str) -> bool:
@@ -637,7 +645,9 @@ def parse_unified_ratelimit_headers(headers) -> dict:
     return data
 
 
-def request_usage_via_probe(access_token: str) -> dict:
+def request_usage_via_probe(
+    access_token: str, model: str = USAGE_PROBE_MODEL
+) -> dict:
     """Read utilization from the rate-limit headers of a minimal model request.
 
     Every ``/v1/messages`` response carries the account's unified 5h/7d
@@ -656,7 +666,7 @@ def request_usage_via_probe(access_token: str) -> dict:
     with its Retry-After.
     """
     body = json.dumps({
-        "model": USAGE_PROBE_MODEL,
+        "model": model,
         "max_tokens": 1,
         "system": USAGE_PROBE_SYSTEM,
         "messages": [{"role": "user", "content": "hi"}],
@@ -689,7 +699,9 @@ def request_usage_via_probe(access_token: str) -> dict:
         return data
 
 
-def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
+def _usage_from_probe(
+    access_token: str, context: str, model: str = USAGE_PROBE_MODEL
+) -> "UsageOutcome":
     """Usage from the header probe, classified like an endpoint fetch.
 
     The result is marked ``source: headers`` and keeps the probe's
@@ -700,7 +712,7 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
     one) instead of failing as ``bad-response``.
     """
     try:
-        data = request_usage_via_probe(access_token)
+        data = request_usage_via_probe(access_token, model)
     except Exception as e:
         kind, retry_after = _classify_usage_error(e)
         cause = kind if retry_after is None else f"{kind}, retry-after {retry_after:.0f}s"
@@ -739,6 +751,24 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
 
 class _InvalidUsageResponse(ValueError):
     """A reported window that cannot be read as a measurement (``bad-response``)."""
+
+
+def _probe_reading_covers(usage: dict | None, probe_model: str) -> bool:
+    """Whether a probe reading has the windows it was asked for: the 7-day
+    window always (a refusal alone counts too), and Fable's when the probe
+    asked Fable."""
+    if not isinstance(usage, dict):
+        return False
+    if "rejected" in usage:
+        return True
+    if not isinstance(usage.get("seven_day"), dict):
+        return False
+    if probe_model != FABLE_PROBE_MODEL:
+        return True
+    return any(
+        isinstance(s, dict) and str(s.get("name", "")).lower() == "fable"
+        for s in usage.get("scoped") or ()
+    )
 
 
 def _reported_window(data: dict, key: str) -> dict | None:
@@ -1133,6 +1163,7 @@ def try_fetch_usage_for_account(
     persist_credentials: Callable[[str, str, str], None] | None = None,
     refresh_via: Callable[[str, str, str], RefreshOutcome] | None = None,
     header_probe: bool = False,
+    probe_model: str | None = None,
 ) -> UsageOutcome:
     """Fetch usage for an account, refreshing expired tokens for inactive accounts only.
 
@@ -1149,6 +1180,14 @@ def try_fetch_usage_for_account(
     instead, in place of the endpoint request, so the caller's poll plan and
     backoff pace it exactly like an endpoint fetch; without it the outcome is
     the ``"setup-token"`` error and no request is sent.
+
+    ``probe_model`` reads an OAuth account from the header probe with that
+    model: an active account (``is_active``) from the probe first, since the
+    endpoint's small per-account budget would otherwise decide whether the
+    account driving every Claude Code session can be read at all, and from
+    the endpoint only when the probe fails or lacks a window; any other
+    account from the endpoint, and from the probe when the endpoint answers
+    429. None keeps the endpoint alone.
     """
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
@@ -1160,6 +1199,20 @@ def try_fetch_usage_for_account(
         if header_probe:
             return _usage_from_probe(access_token, context)
         return UsageOutcome(None, error="setup-token")
+
+    probe_failure: UsageOutcome | None = None
+    if is_active and probe_model is not None:
+        probed = _usage_from_probe(access_token, context, probe_model)
+        if probed.error is None and _probe_reading_covers(probed.usage, probe_model):
+            return probed
+        # A probe the server did not answer (overloaded, network) or whose
+        # headers lack a window is no reason to treat the account as
+        # unreadable: the endpoint still may answer. If it does not, the
+        # probe's own failure is what is recorded (below).
+        probe_failure = (
+            probed if probed.error is not None
+            else UsageOutcome(None, error="bad-response")
+        )
 
     working_credentials = credentials
 
@@ -1209,6 +1262,21 @@ def try_fetch_usage_for_account(
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
+        if probe_failure is not None and e.code != 401:
+            # The active account's probe already failed. The endpoint's
+            # refusal (often an hour-long 429) must not be recorded as this
+            # account's state: its backoff would also hold off the probe,
+            # which is what reads the active account.
+            _logger.debug("Usage endpoint fallback failed %s: %s", context, kind)
+            return probe_failure
+        if e.code == 429 and probe_model is not None and probe_failure is None:
+            probed = _usage_from_probe(access_token, context, probe_model)
+            if probed.error is None:
+                _logger.info(
+                    "Usage endpoint answered 429 %s (retry-after %s); read "
+                    "from the header probe", context, retry_after,
+                )
+                return probed
         if (
             e.code != 401
             or is_active
@@ -1261,6 +1329,8 @@ def try_fetch_usage_for_account(
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
             return UsageOutcome(None, error=kind, retry_after_s=retry_after)
     except Exception as e:
+        if probe_failure is not None:
+            return probe_failure
         kind, retry_after = _classify_usage_error(e)
         _log_usage_failure(context, e, kind, retry_after)
         return UsageOutcome(None, error=kind, retry_after_s=retry_after)

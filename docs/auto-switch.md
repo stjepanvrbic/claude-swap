@@ -58,6 +58,10 @@ Logins from before Claude Code recorded the expiry carry none, and are not affec
 
 Usage polling is adaptive — a couple of accounts per check, busy alternates watched more closely, and exhausted ones checked about every ten minutes (or slower after 429s) — so API traffic stays flat no matter how many accounts you manage.
 
+The active account is read from the rate-limit headers of a one-token request (the header probe), not from the usage endpoint, which answers only about 30 requests an hour per account. With `--model Fable` the probe asks Fable, since only a Fable response carries Fable's weekly window; with no `--model` it asks Haiku. Any other account is read from the endpoint, and from the probe when the endpoint answers 429. A `--model` other than Fable keeps every read on the endpoint, since the headers do not carry that window.
+
+Only one background worker runs per backup directory: a second one, however it was started, exits at once.
+
 ## When something fails
 
 It fails safe: if a usage check errors it keeps trusting the last-known numbers, for a bounded time, while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).

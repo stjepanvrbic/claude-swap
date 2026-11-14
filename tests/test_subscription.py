@@ -935,10 +935,10 @@ class TestTuiMarker:
         )
 
     def test_stale_age_uses_the_same_wording_as_list(self):
-        """12h old is the first stale moment — it must not read as "0d ago"."""
+        """Two TTLs old is the first stale moment, worded as list words it."""
         old_at = time.time() - 2 * subscription.PLAN_TTL_S - 60
         rendered = self._render({"plan": TEAM, "fetchedAt": old_at})
-        assert "(12h ago)" in rendered
+        assert "(2h ago)" in rendered
 
     def test_nothing_without_a_record(self):
         assert self._render(None) == ""

@@ -23,9 +23,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_swap.locking import InstanceLock
 from claude_swap.settings import load_settings, set_setting
 
 PID_FILENAME = "autoswitch_background.pid"
+LOCK_FILENAME = "autoswitch_background.lock"
 LOG_FILENAME = "autoswitch_background.log"
 STDERR_FILENAME = "autoswitch_background.err"
 # A poll line every tick is ~2 MB a day at the 15 s minimum interval, so
@@ -33,6 +35,9 @@ STDERR_FILENAME = "autoswitch_background.err"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 3
 STDERR_MAX_BYTES = 1024 * 1024
+# How long `start` waits to see the new worker take the lock (a loaded host
+# or a Windows venv launcher can take seconds).
+START_WAIT_S = 15.0
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,12 @@ class BackgroundStatus:
 
 def pid_path(backup_root: Path) -> Path:
     return backup_root / PID_FILENAME
+
+
+def worker_lock(backup_root: Path) -> InstanceLock:
+    """Held by the running worker for its lifetime; it writes its own pid to
+    the pid file, so the file names the worker that actually runs."""
+    return InstanceLock(backup_root / LOCK_FILENAME, pid_path(backup_root))
 
 
 def log_path(backup_root: Path) -> Path:
@@ -108,13 +119,6 @@ def _read_pid(path: Path) -> int | None:
     return pid if pid > 0 else None
 
 
-def _write_pid(path: Path, pid: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{pid}\n", encoding="utf-8")
-    if sys.platform != "win32":
-        os.chmod(path, 0o600)
-
-
 def _remove_pid(path: Path) -> None:
     try:
         path.unlink()
@@ -159,7 +163,7 @@ def status(backup_root: Path) -> BackgroundStatus:
         enabled=settings.enabled,
         paused=settings.paused,
         pid=pid,
-        running=_process_running(pid),
+        running=worker_lock(backup_root).held_elsewhere() or _process_running(pid),
         pid_path=path,
         log_path=log_path(backup_root),
     )
@@ -207,7 +211,15 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
             env=env,
             **popen_kwargs,
         )
-    _write_pid(current.pid_path, proc.pid)
+    # The worker writes its own pid once it holds the lock: the launched
+    # process may be a launcher (a Windows venv's python.exe), or a duplicate
+    # that leaves at once. Report what happened rather than what was spawned.
+    deadline = time.monotonic() + START_WAIT_S
+    while time.monotonic() < deadline:
+        st = status(backup_root)
+        if worker_lock(backup_root).held_elsewhere() or proc.poll() is not None:
+            return st
+        time.sleep(0.1)
     return status(backup_root)
 
 

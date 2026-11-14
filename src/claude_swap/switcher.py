@@ -2100,6 +2100,19 @@ class ClaudeAccountSwitcher:
         self._header_probe_cache = (mtime, enabled)
         return enabled
 
+    def _usage_probe_model(self) -> str | None:
+        """The header-probe model that reports every window switching is
+        judged on, or None when only the usage endpoint does: Haiku for the
+        5h/7d windows alone, Fable when Fable's weekly window counts too
+        (only a Fable response carries it); another model's window is in the
+        endpoint alone."""
+        models = {m.lower() for m in self._poll_policy_inputs()[2]}
+        if not models:
+            return oauth.USAGE_PROBE_MODEL
+        if models == {"fable"}:
+            return oauth.FABLE_PROBE_MODEL
+        return None
+
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
 
@@ -4740,6 +4753,7 @@ class ClaudeAccountSwitcher:
             outcome = oauth.try_fetch_usage_for_account(
                 account_num, email, creds, is_active=True,
                 header_probe=self._header_probe_enabled(),
+                probe_model=self._usage_probe_model(),
             )
             if outcome.error != "http-401":
                 if outcome.usage is not None:
@@ -5232,6 +5246,7 @@ class ClaudeAccountSwitcher:
         outcome = oauth.try_fetch_usage_for_account(
             account_num, email, working, is_active=True,
             header_probe=self._header_probe_enabled(),
+            probe_model=self._usage_probe_model(),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -5524,6 +5539,7 @@ class ClaudeAccountSwitcher:
             is_active=False,
             refresh_via=self.consume_backup_grant,
             header_probe=self._header_probe_enabled(),
+            probe_model=self._usage_probe_model(),
         )
         return FetchRecord(
             usage=outcome.usage,
@@ -5548,6 +5564,7 @@ class ClaudeAccountSwitcher:
         outcome = oauth.try_fetch_usage_for_account(
             num, email, creds, is_active=True,
             header_probe=self._header_probe_enabled(),
+            probe_model=self._usage_probe_model(),
         )
         if outcome.error == "http-401":
             return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp)
