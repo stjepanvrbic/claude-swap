@@ -10,7 +10,7 @@ import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from claude_swap.printer import warning as print_warning
@@ -1131,6 +1131,45 @@ class UsageOutcome:
     # permanent auth kind — lets the store bind the strike to that
     # generation (see usage_store.FetchRecord.struck_fp).
     struck_fp: str | None = None
+    # The usage requests this fetch made, in order ("endpoint", "probe"), and
+    # those that answered 429 (rate limited, not a quota refusal), even when
+    # another then succeeded. The two have separate budgets, so each is paced
+    # by its own 429s (see usage_store.FetchRecord).
+    asked: tuple[str, ...] = ()
+    refused_429: tuple[str, ...] = ()
+
+
+class _Requests:
+    """The usage requests one fetch made, in order, and those refused 429."""
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+        self.refused: list[str] = []
+
+    def endpoint(self, access_token: str) -> dict:
+        self.asked.append("endpoint")
+        try:
+            return request_usage_data(access_token)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                self.refused.append("endpoint")
+            raise
+
+    def probe(
+        self, access_token: str, context: str, model: str = USAGE_PROBE_MODEL
+    ) -> "UsageOutcome":
+        self.asked.append("probe")
+        outcome = _usage_from_probe(access_token, context, model)
+        if outcome.error == "http-429":
+            self.refused.append("probe")
+        return outcome
+
+    def tag(self, outcome: "UsageOutcome") -> "UsageOutcome":
+        return replace(
+            outcome,
+            asked=tuple(dict.fromkeys(self.asked)),
+            refused_429=tuple(dict.fromkeys(self.refused)),
+        )
 
 
 def fetch_usage(access_token: str) -> dict | None:
@@ -1189,6 +1228,26 @@ def try_fetch_usage_for_account(
     account from the endpoint, and from the probe when the endpoint answers
     429. None keeps the endpoint alone.
     """
+    trail = _Requests()
+    return trail.tag(_try_fetch_usage(
+        account_num, email, credentials, is_active, persist_credentials,
+        refresh_via, header_probe, probe_model, trail,
+    ))
+
+
+def _try_fetch_usage(
+    account_num: str,
+    email: str,
+    credentials: str,
+    is_active: bool,
+    persist_credentials: Callable[[str, str, str], None] | None,
+    refresh_via: Callable[[str, str, str], RefreshOutcome] | None,
+    header_probe: bool,
+    probe_model: str | None,
+    trail: _Requests,
+) -> UsageOutcome:
+    """:func:`try_fetch_usage_for_account`, making its requests through
+    ``trail`` so they are recorded."""
     context = f"for account {account_num}"  # no email: paste-safe for public issues
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
@@ -1197,12 +1256,12 @@ def try_fetch_usage_for_account(
 
     if is_setup_token(oauth):
         if header_probe:
-            return _usage_from_probe(access_token, context)
+            return trail.probe(access_token, context)
         return UsageOutcome(None, error="setup-token")
 
     probe_failure: UsageOutcome | None = None
     if is_active and probe_model is not None:
-        probed = _usage_from_probe(access_token, context, probe_model)
+        probed = trail.probe(access_token, context, probe_model)
         if probed.error is None and _probe_reading_covers(probed.usage, probe_model):
             return probed
         # A probe the server did not answer (overloaded, network) or whose
@@ -1258,7 +1317,7 @@ def try_fetch_usage_for_account(
         # the 401 path below retries the refresh.
 
     try:
-        data = request_usage_data(access_token)
+        data = trail.endpoint(access_token)
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
@@ -1270,7 +1329,7 @@ def try_fetch_usage_for_account(
             _logger.debug("Usage endpoint fallback failed %s: %s", context, kind)
             return probe_failure
         if e.code == 429 and probe_model is not None and probe_failure is None:
-            probed = _usage_from_probe(access_token, context, probe_model)
+            probed = trail.probe(access_token, context, probe_model)
             if probed.error is None:
                 _logger.info(
                     "Usage endpoint answered 429 %s (retry-after %s); read "
@@ -1322,7 +1381,7 @@ def try_fetch_usage_for_account(
             return UsageOutcome(None, error="refresh-failed")
 
         try:
-            data = request_usage_data(new_token)
+            data = trail.endpoint(new_token)
             return UsageOutcome(build_usage_result(data))
         except Exception as retry_error:
             kind, retry_after = _classify_usage_error(retry_error)

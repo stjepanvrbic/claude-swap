@@ -136,7 +136,7 @@ RECENT_429_WINDOW_S = 3600.0
 # interval (×POST_429_BACKOFF_MULT) toward POST_429_MAX_INTERVAL_S — wider than
 # the normal candidate ceiling so several machines can each back off far enough
 # that their combined rate fits under the budget. Movement (a real success run
-# with no recent 429) decays it back down. This is TCP-style congestion control:
+# with no recent 429) brings it straight back under the account's ceiling. This is TCP-style congestion control:
 # the budget gets fair-shared by reaction alone, with no machine count or
 # shared state to configure.
 POST_429_BACKOFF_MULT = 1.5
@@ -214,12 +214,15 @@ def plan_after_fetch(
     """``(next_poll_at, interval_s)`` for an account just fetched successfully.
 
     Movement (binding pct changed ≥ ``MOVEMENT_DELTA_PCT`` since the previous
-    poll) halves the interval, floored at ``MIN_INTERVAL_S`` — or drops to
+    poll) halves the interval, floored at ``MIN_INTERVAL_S`` and capped at
+    the account's ceiling — or drops to
     ``URGENT_INTERVAL_S`` when one of the active account's windows rose by
     that much into the escalation band under its own line (``threshold`` for
     the 5h window, ``weekly_threshold`` when set for the weekly ones). No
     movement backs off ×1.5 toward the account's ceiling;
-    unknown utilization uses the default. A recent 429 on this token floors
+    unknown utilization uses the default. A recent 429 on a request this
+    fetch made (the endpoint, the header probe; see ``FetchRecord.asked``)
+    floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window
@@ -237,7 +240,9 @@ def plan_after_fetch(
         interval = default
     elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
         moving = True
-        interval = max(MIN_INTERVAL_S, base / 2)
+        # Capped too: a base left wide by a past 429 run must not let a
+        # moving account wait longer than an idle one.
+        interval = min(ceiling, max(MIN_INTERVAL_S, base / 2))
     else:
         # Floored so a sub-floor base (urgent mode's 60s) snaps straight back
         # to the normal cadence once movement stops, instead of decaying
