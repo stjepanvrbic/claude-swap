@@ -167,14 +167,14 @@ def usage_rows(
                 suffix = f"{suffix}  {marker}" if suffix else marker
                 suffix_full = f"{suffix_full}  {marker}" if suffix_full else marker
         rows.append((window["name"], pct, suffix, suffix_full))
-    rejected = last_good.get("rejected")
-    if isinstance(rejected, dict):
-        # A refused setup-token probe: at its limit until the refusal ends,
+    rejected = oauth.unexplained_refusal(last_good)
+    if rejected is not None:
+        # Refused below every window's limit: blocked until the refusal ends,
         # whatever the windows above say (auto-switching excludes it).
         reset, reset_full = _reset_parts(rejected, now)
-        suffix = f"rejected (!)  {reset}" if reset else "rejected (!)"
-        suffix_full = f"rejected (!)  {reset_full}" if reset_full else "rejected (!)"
-        rows.append(("probe", 100.0, suffix, suffix_full))
+        suffix = f"reached (!)  {reset}" if reset else "reached (!)"
+        suffix_full = f"reached (!)  {reset_full}" if reset_full else "reached (!)"
+        rows.append(("limit", 100.0, suffix, suffix_full))
     return rows
 
 
@@ -429,8 +429,8 @@ def mini_account_text(
         for w in (last_good.get("scoped") or [] if isinstance(last_good, dict) else [])
         if float(w["pct"]) >= 100
     ]
-    if isinstance(last_good, dict) and isinstance(last_good.get("rejected"), dict):
-        maxed.append("rejected")  # a refused setup-token probe
+    if oauth.unexplained_refusal(last_good) is not None:
+        maxed.append("limit")
     for name in maxed:
         if parts:
             text.append(" · ", style=palette.track)

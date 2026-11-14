@@ -442,3 +442,73 @@ def test_only_one_worker_runs_per_backup_root(worker_root: Path):
                 pass
             first.kill()
             first.wait()
+
+
+_STARTER = (
+    "import sys, pathlib\n"
+    "from claude_swap import background\n"
+    "sys.stdin.readline()\n"
+    "background.start(pathlib.Path(sys.argv[1]))\n"
+)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="job objects are Windows-only")
+def test_a_worker_outlives_the_job_of_the_session_that_started_it(worker_root: Path):
+    """An SSH session runs in a job that kills its processes when it closes."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimits),
+            ("IoInfo", ctypes.c_uint64 * 6),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kill_on_job_close, breakaway_ok = 0x2000, 0x0800
+    job = kernel32.CreateJobObjectW(None, None)
+    assert job, ctypes.get_last_error()
+    limits = ExtendedLimits()
+    limits.BasicLimitInformation.LimitFlags = kill_on_job_close | breakaway_ok
+    assert kernel32.SetInformationJobObject(
+        wintypes.HANDLE(job), 9, ctypes.byref(limits), ctypes.sizeof(limits)
+    ), ctypes.get_last_error()
+
+    starter = subprocess.Popen(
+        [sys.executable, "-c", _STARTER, str(worker_root)],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    process = kernel32.OpenProcess(0x0100 | 0x0001, False, starter.pid)  # SET_QUOTA | TERMINATE
+    assert process, ctypes.get_last_error()
+    assert kernel32.AssignProcessToJobObject(
+        wintypes.HANDLE(job), wintypes.HANDLE(process)
+    ), ctypes.get_last_error()
+    kernel32.CloseHandle(wintypes.HANDLE(process))
+    starter.communicate(b"go\n", timeout=120)
+    lock = background.worker_lock(worker_root)
+    assert lock.held_elsewhere()
+
+    kernel32.CloseHandle(wintypes.HANDLE(job))  # the session ends
+    time.sleep(3)
+
+    assert lock.held_elsewhere()
+    assert background.status(worker_root).running

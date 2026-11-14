@@ -26,6 +26,8 @@ from pathlib import Path
 from claude_swap.locking import InstanceLock
 from claude_swap.settings import load_settings, set_setting
 
+_logger = logging.getLogger("claude-swap")
+
 PID_FILENAME = "autoswitch_background.pid"
 LOCK_FILENAME = "autoswitch_background.lock"
 LOG_FILENAME = "autoswitch_background.log"
@@ -188,29 +190,47 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
     if debug:
         args.append("--debug")
 
-    creationflags = 0
+    launch_flags = [0]
     popen_kwargs = {}
     if sys.platform == "win32":
         # A hidden console, not DETACHED_PROCESS: the venv launcher's child
         # python would otherwise open a visible console that kills it on close.
-        creationflags = (
+        hidden = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
+        # Out of the caller's job object as well: an SSH session runs in a
+        # job that kills every process in it when the session closes. A job
+        # that forbids breakaway refuses the launch, and the worker then
+        # lives only as long as its caller.
+        launch_flags = [
+            hidden | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0),
+            hidden,
+        ]
     else:
         popen_kwargs["start_new_session"] = True
 
     with open(err, err_mode, buffering=0) as err_file:
-        proc = subprocess.Popen(
-            args,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=err_file,
-            close_fds=True,
-            creationflags=creationflags,
-            env=env,
-            **popen_kwargs,
-        )
+        for attempt, creationflags in enumerate(launch_flags, start=1):
+            try:
+                proc = subprocess.Popen(
+                    args,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=err_file,
+                    close_fds=True,
+                    creationflags=creationflags,
+                    env=env,
+                    **popen_kwargs,
+                )
+                break
+            except PermissionError:
+                if attempt == len(launch_flags):
+                    raise
+                _logger.warning(
+                    "This session's job object keeps its processes: the "
+                    "auto-switch worker stops when this session ends."
+                )
     # The worker writes its own pid once it holds the lock: the launched
     # process may be a launcher (a Windows venv's python.exe), or a duplicate
     # that leaves at once. Report what happened rather than what was spawned.

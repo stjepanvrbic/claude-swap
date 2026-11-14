@@ -25,7 +25,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace, subscription
+from claude_swap import background, oauth, pace, subscription
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -186,12 +186,11 @@ def _usage_rows(usage: dict, fetched_at: float | None = None) -> list[tuple[str,
             rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
         else:
             rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}"))
-    rejected = usage.get("rejected")
-    if isinstance(rejected, dict):
-        # A refused header probe (setup-tokens): at its limit until it ends.
+    rejected = oauth.unexplained_refusal(usage)
+    if rejected is not None:
         cell = oauth.fresh_reset_strings(rejected)
-        body = f"rejected   until {cell[1]:<12}  in {cell[0]}" if cell else "rejected"
-        rows.append(("probe", body))
+        body = f"reached   until {cell[1]:<12}  in {cell[0]}" if cell else "reached"
+        rows.append(("limit", body))
     return rows
 
 
@@ -6277,11 +6276,16 @@ class ClaudeAccountSwitcher:
         # in the JSON payload and logs for diagnostics.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
-        if dup_warnings or lockstep_warnings:
+        auto_switch = background.status(self.backup_dir)
+        worker_warnings = (
+            ["Auto-switch is on but its worker is not running, so nothing "
+             "switches accounts. Start it: cswap auto start"]
+            if auto_switch.enabled and not auto_switch.running
+            else []
+        )
+        if dup_warnings or lockstep_warnings or worker_warnings:
             print()
-            for msg in dup_warnings:
-                warning(msg)
-            for msg in lockstep_warnings:
+            for msg in (*dup_warnings, *lockstep_warnings, *worker_warnings):
                 warning(msg)
 
         # Running instances
