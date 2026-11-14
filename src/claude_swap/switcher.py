@@ -4794,6 +4794,8 @@ class ClaudeAccountSwitcher:
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
+                    first_asked=outcome.first_asked,
+                    refused_429=outcome.refused_429,
                 )
             # A locally-valid token the server rejects: revoked out-of-band
             # (measured: a sibling machine rotating a synced lineage kills
@@ -5252,6 +5254,8 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            first_asked=outcome.first_asked,
+            refused_429=outcome.refused_429,
         )
 
     def _resync_rotated_backup(
@@ -5546,6 +5550,8 @@ class ClaudeAccountSwitcher:
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
+            first_asked=outcome.first_asked,
+            refused_429=outcome.refused_429,
         )
 
     def _read_only_fetch(
@@ -5572,6 +5578,8 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
+            first_asked=outcome.first_asked,
+            refused_429=outcome.refused_429,
         )
 
     def _run_usage_fetches(
@@ -5865,19 +5873,11 @@ class ClaudeAccountSwitcher:
             if rec.sentinel is not None or rec.error is not None:
                 continue
             before = pre.get(num)
-            # A 429 is the usage endpoint's budget. The active account is read
-            # from the header probe first and never spends it then, so its
-            # cadence ignores that history; any other account's probe reading
-            # came after an endpoint attempt, and the next one tries the
-            # endpoint again, so it keeps the 429 pacing.
-            is_active = bool(info_by_num[num][4])
-            probe_first = (
-                is_active
-                and isinstance(rec.usage, dict)
-                and rec.usage.get("source") == oauth.USAGE_SOURCE_HEADERS
-            )
-            recent_429 = (
-                not probe_first and before is not None and before.recent_429(now)
+            # The next fetch starts with the request this one started with,
+            # so it is paced by that request's own 429s: the endpoint's budget
+            # does not slow an account read from the header probe first.
+            recent_429 = before is not None and before.recent_429(
+                now, rec.first_asked or "endpoint"
             )
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,

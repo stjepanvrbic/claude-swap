@@ -237,6 +237,10 @@ PERMANENT_AUTH_ERRORS = frozenset({"invalid_grant", "no_refresh_token"})
 Identity = tuple[str, str]
 
 
+# Where a 429 from each usage request is stamped on the row.
+_429_STAMP = {"endpoint": "last429At", "probe": "lastProbe429At"}
+
+
 @dataclass(frozen=True)
 class FetchRecord:
     """Outcome of one fetch attempt, as handed to :meth:`UsageStore.record`.
@@ -267,6 +271,14 @@ class FetchRecord:
     # persists: later passes skip the request while the credential still
     # carries that token, and a success clears it.
     rejected_fp: str | None = None
+    # The request this fetch made first ("endpoint" or "probe") and those
+    # that answered 429. Each request has its own budget, so a 429 is stamped
+    # per request (``last429At`` / ``lastProbe429At``), even on a fetch that
+    # then succeeded through the other, and the next plan is paced by the
+    # 429s of the request it starts with. Empty from writers that predate
+    # it: their http-429 error stamps the endpoint, as before.
+    first_asked: str | None = None
+    refused_429: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -293,6 +305,8 @@ class UsageEntry:
     # poll_policy.POST_429_MIN_INTERVAL_S until RECENT_429_WINDOW_S has
     # passed, giving the saturated rolling-hour window time to age out.
     last_429_at: float | None = None
+    # When the header probe last answered 429; see ``recent_429``.
+    last_probe_429_at: float | None = None
     # Consecutive permanent-auth failures (``invalid_grant``). At or above
     # AUTH_DEAD_STRIKES the token is treated as dead: see ``token_dead``.
     auth_dead_strikes: int = 0
@@ -325,7 +339,7 @@ class UsageEntry:
         """Whether an adopted reading's hold still keeps collectors off."""
         return self.held_until is not None and now < self.held_until
 
-    def recent_429(self, now: float) -> bool:
+    def recent_429(self, now: float, request: str = "endpoint") -> bool:
         """Whether this token 429'd recently enough to keep the post-429 cadence.
 
         Recency is measured from when the 429's honored backoff *lifts*, not
@@ -340,9 +354,10 @@ class UsageEntry:
         still expires normally. Bounded by ``RECENT_429_WINDOW_S`` past the
         anchor so it clears once the saturated window has aged out.
         """
-        if self.last_429_at is None:
+        stamp = self.last_probe_429_at if request == "probe" else self.last_429_at
+        if stamp is None:
             return False
-        anchor = self.last_429_at
+        anchor = stamp
         # Use the backoff anchor only while the LIVE backoff is a 429 backoff.
         # last429At is never cleared, but backoffUntil/lastError are rewritten by
         # any later failure — so without the lastError guard an unrelated timeout
@@ -1005,6 +1020,7 @@ class UsageStore:
                 next_poll_at=next_poll_at,
                 poll_interval_s=_num_or_none(row.get("pollIntervalS")),
                 last_429_at=_num_or_none(row.get("last429At")),
+                last_probe_429_at=_num_or_none(row.get("lastProbe429At")),
                 auth_dead_strikes=int(row.get("authDeadStrikes") or 0),
                 struck_fingerprint=row.get("struckFingerprint"),
                 rejected_fingerprint=row.get("rejectedFingerprint"),
@@ -1145,6 +1161,8 @@ class UsageStore:
                     row["rejectedFingerprint"] = rec.rejected_fp
                 return
             row["lastAttemptAt"] = now
+            for kind in rec.refused_429:
+                row[_429_STAMP[kind]] = now
             if rec.error is None:
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
@@ -1164,7 +1182,7 @@ class UsageStore:
                 failures = int(row.get("consecutiveFailures") or 0) + 1
                 row["consecutiveFailures"] = failures
                 row["lastError"] = rec.error
-                if rec.error == "http-429":
+                if rec.error == "http-429" and not rec.refused_429:
                     # Kept across later successes: the poll planner floors the
                     # cadence while a 429 is recent (see UsageEntry.last_429_at).
                     row["last429At"] = now

@@ -1942,3 +1942,66 @@ class TestRefusedFetchLogsTheServerReason:
             "Usage fetch failed for account 3: http-429 "
             "(usage-endpoint budget reached; backing off)"
         ]
+
+
+
+class TestRequestTrail:
+    """A fetch says which usage request it made first and which answered 429."""
+
+    CREDS = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-t", "refreshToken": "rt-t",
+        "expiresAt": 4_102_444_800_000,
+    }})
+
+    @staticmethod
+    def _429(url="https://api.anthropic.com/api/oauth/usage"):
+        return urllib.error.HTTPError(url, 429, "Too Many Requests", {"Retry-After": "0"}, None)
+
+    def _fetch(self, monkeypatch, *, is_active, endpoint, probe):
+        def ask_endpoint(token):
+            if isinstance(endpoint, Exception):
+                raise endpoint
+            return endpoint
+
+        def ask_probe(token, model=None):
+            if isinstance(probe, Exception):
+                raise probe
+            return probe
+
+        monkeypatch.setattr(oauth, "request_usage_data", ask_endpoint)
+        monkeypatch.setattr(oauth, "request_usage_via_probe", ask_probe)
+        return oauth.try_fetch_usage_for_account(
+            "2", "a@example.com", self.CREDS, is_active=is_active,
+            probe_model=oauth.FABLE_PROBE_MODEL,
+        )
+
+    HEADERS = {
+        "seven_day": {"utilization": 40.0},
+        "limits": [{"kind": "weekly_scoped",
+                    "scope": {"model": {"display_name": "Fable"}}, "percent": 50.0}],
+    }
+
+    def test_an_inactive_fallback_names_the_endpoint_429(self, monkeypatch):
+        outcome = self._fetch(
+            monkeypatch, is_active=False, endpoint=self._429(), probe=self.HEADERS
+        )
+        assert outcome.error is None
+        assert outcome.first_asked == "endpoint"
+        assert outcome.refused_429 == ("endpoint",)
+
+    def test_an_active_probe_read_asks_the_probe_first(self, monkeypatch):
+        outcome = self._fetch(
+            monkeypatch, is_active=True, endpoint={"seven_day": None}, probe=self.HEADERS
+        )
+        assert outcome.first_asked == "probe"
+        assert outcome.refused_429 == ()
+
+    def test_a_refused_probe_then_an_endpoint_answer(self, monkeypatch):
+        outcome = self._fetch(
+            monkeypatch, is_active=True,
+            endpoint={"seven_day": {"utilization": 40.0}},
+            probe=self._429("https://api.anthropic.com/v1/messages"),
+        )
+        assert outcome.error is None
+        assert outcome.first_asked == "probe"
+        assert outcome.refused_429 == ("probe",)
