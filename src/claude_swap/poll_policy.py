@@ -220,9 +220,9 @@ def plan_after_fetch(
     that much into the escalation band under its own line (``threshold`` for
     the 5h window, ``weekly_threshold`` when set for the weekly ones). No
     movement backs off ×1.5 toward the account's ceiling;
-    unknown utilization uses the default. A recent 429 on the request this
-    fetch started with (the endpoint, or the header probe; see
-    ``FetchRecord.first_asked``) floors
+    unknown utilization uses the default. A recent 429 on a request this
+    fetch made (the endpoint, the header probe; see ``FetchRecord.asked``)
+    floors
     the cadence at ``POST_429_MIN_INTERVAL_S`` (and suppresses urgent mode)
     until ``RECENT_429_WINDOW_S`` has passed. The scheduled time gets
     ``JITTER_FRAC`` noise, is never later than the account's next window

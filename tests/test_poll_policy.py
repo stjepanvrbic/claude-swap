@@ -455,9 +455,9 @@ class TestCadenceAfterA429Run:
 
     @staticmethod
     def _interval(
-        temp_home, *, first_asked: str, active: bool = True,
+        temp_home, *, asked: tuple, active: bool = True,
         prev_interval: float = 1800.0, endpoint_429: bool = True,
-        probe_429: bool = False,
+        probe_429: bool = False, refused: tuple = (),
     ) -> float:
         import time
 
@@ -477,33 +477,66 @@ class TestCadenceAfterA429Run:
         )
         info = (2, "a@example.com", "", "", active, "", "")
         record = FetchRecord(
-            usage=dict(TestCadenceAfterA429Run.NEAR_LINE), first_asked=first_asked
+            usage=dict(TestCadenceAfterA429Run.NEAR_LINE),
+            asked=asked, refused_429=refused,
         )
         plans = switcher._plans_after_fetch({"2": record}, {"2": before}, {"2": info})
         return plans["2"][1]
 
-    def test_an_endpoint_429_does_not_slow_a_probe_first_read(self, temp_home):
+    def test_an_endpoint_429_does_not_slow_a_probe_only_read(self, temp_home):
         assert self._interval(
-            temp_home, first_asked="probe"
+            temp_home, asked=("probe",)
         ) == poll_policy.URGENT_INTERVAL_S
 
-    def test_a_probe_429_paces_the_next_probe_first_read(self, temp_home):
+    def test_a_probe_429_paces_the_next_probe_read(self, temp_home):
         assert self._interval(
-            temp_home, first_asked="probe", endpoint_429=False, probe_429=True
+            temp_home, asked=("probe",), endpoint_429=False, probe_429=True
         ) == poll_policy.POST_429_MAX_INTERVAL_S
 
-    def test_an_endpoint_first_read_keeps_the_endpoint_429_pacing(self, temp_home):
-        # Also an inactive account whose endpoint answered 429 and whose
-        # probe fallback succeeded: its next read asks the endpoint again.
-        # From 300 s a moving account would halve to 180 s without it.
+    def test_an_endpoint_fallback_keeps_the_endpoint_pacing(self, temp_home):
+        # The probe failed and the endpoint answered: the next fetch may well
+        # ask the endpoint again. From 300 s it would otherwise drop to 60 s.
         assert self._interval(
-            temp_home, first_asked="endpoint", active=False, prev_interval=300.0
+            temp_home, asked=("probe", "endpoint"), prev_interval=300.0
+        ) == 450.0
+
+    def test_an_endpoint_first_read_keeps_the_endpoint_pacing(self, temp_home):
+        assert self._interval(
+            temp_home, asked=("endpoint",), active=False, prev_interval=300.0
+        ) == 450.0
+
+    def test_a_429_in_this_fetch_paces_the_very_next_one(self, temp_home):
+        # A clean row: an inactive account whose endpoint answered 429 just
+        # now and whose probe fallback succeeded.
+        assert self._interval(
+            temp_home, asked=("endpoint", "probe"), refused=("endpoint",),
+            active=False, prev_interval=300.0, endpoint_429=False,
+        ) == 450.0
+
+    def test_an_active_probe_429_then_an_endpoint_answer_is_paced(self, temp_home):
+        assert self._interval(
+            temp_home, asked=("probe", "endpoint"), refused=("probe",),
+            prev_interval=300.0, endpoint_429=False,
         ) == 450.0
 
     def test_an_endpoint_429_still_grows_the_endpoint_interval(self, temp_home):
         assert self._interval(
-            temp_home, first_asked="endpoint"
+            temp_home, asked=("endpoint",)
         ) == poll_policy.POST_429_MAX_INTERVAL_S
+
+
+class TestTheBackoffBelongsToTheRequestThatSetIt:
+    def test_an_endpoint_backoff_does_not_revive_an_old_probe_429(self):
+        from claude_swap.usage_store import UsageEntry
+
+        entry = UsageEntry(
+            last_probe_429_at=NOW - 3 * 3600,
+            last_429_at=NOW - 3600 + 30,
+            last_error="http-429",
+            backoff_until=NOW - 5,
+        )
+        assert entry.recent_429(NOW, "probe") is False
+        assert entry.recent_429(NOW, "endpoint") is True
 
 
 class TestA429IsStampedOnTheRequestThatAnsweredIt:
@@ -520,7 +553,7 @@ class TestA429IsStampedOnTheRequestThatAnsweredIt:
         from claude_swap.usage_store import FetchRecord
 
         entry = self._row(tmp_path, FetchRecord(
-            usage=_usage(10), first_asked="endpoint", refused_429=("endpoint",)
+            usage=_usage(10), asked=("endpoint", "probe"), refused_429=("endpoint",)
         ))
         assert entry.last_429_at == NOW
         assert entry.last_probe_429_at is None
@@ -529,12 +562,21 @@ class TestA429IsStampedOnTheRequestThatAnsweredIt:
         from claude_swap.usage_store import FetchRecord
 
         entry = self._row(tmp_path, FetchRecord(
-            error="http-429", first_asked="probe", refused_429=("probe",)
+            error="http-429", asked=("probe",), refused_429=("probe",)
         ))
         assert entry.last_probe_429_at == NOW
         assert entry.last_429_at is None
 
-    def test_a_429_error_from_an_older_writer_stamps_the_endpoint(self, tmp_path):
+    def test_a_refused_read_only_fetch_still_stamps_its_429(self, tmp_path):
+        from claude_swap.usage_store import FetchRecord
+
+        entry = self._row(tmp_path, FetchRecord(
+            sentinel="token expired", asked=("probe", "endpoint"),
+            refused_429=("probe",),
+        ))
+        assert entry.last_probe_429_at == NOW
+
+    def test_an_untagged_429_error_is_the_endpoints(self, tmp_path):
         from claude_swap.usage_store import FetchRecord
 
         entry = self._row(tmp_path, FetchRecord(error="http-429"))

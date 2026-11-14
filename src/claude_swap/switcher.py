@@ -4794,7 +4794,7 @@ class ClaudeAccountSwitcher:
                     usage=outcome.usage,
                     error=outcome.error,
                     retry_after_s=outcome.retry_after_s,
-                    first_asked=outcome.first_asked,
+                    asked=outcome.asked,
                     refused_429=outcome.refused_429,
                 )
             # A locally-valid token the server rejects: revoked out-of-band
@@ -4808,6 +4808,7 @@ class ClaudeAccountSwitcher:
             # sentinel mislabeling an unexpired token.
             force_refresh = FetchRecord(
                 error=outcome.error, retry_after_s=outcome.retry_after_s,
+                asked=outcome.asked, refused_429=outcome.refused_429,
             )
 
         # Expired (or server-rejected). Before any recovery that would
@@ -5254,7 +5255,7 @@ class ClaudeAccountSwitcher:
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
-            first_asked=outcome.first_asked,
+            asked=outcome.asked,
             refused_429=outcome.refused_429,
         )
 
@@ -5550,7 +5551,7 @@ class ClaudeAccountSwitcher:
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
             struck_fp=outcome.struck_fp,
-            first_asked=outcome.first_asked,
+            asked=outcome.asked,
             refused_429=outcome.refused_429,
         )
 
@@ -5573,12 +5574,15 @@ class ClaudeAccountSwitcher:
             probe_model=self._usage_probe_model(),
         )
         if outcome.error == "http-401":
-            return FetchRecord(sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp)
+            return FetchRecord(
+                sentinel=USAGE_TOKEN_EXPIRED, rejected_fp=stamp,
+                asked=outcome.asked, refused_429=outcome.refused_429,
+            )
         return FetchRecord(
             usage=outcome.usage,
             error=outcome.error,
             retry_after_s=outcome.retry_after_s,
-            first_asked=outcome.first_asked,
+            asked=outcome.asked,
             refused_429=outcome.refused_429,
         )
 
@@ -5873,11 +5877,14 @@ class ClaudeAccountSwitcher:
             if rec.sentinel is not None or rec.error is not None:
                 continue
             before = pre.get(num)
-            # The next fetch starts with the request this one started with,
-            # so it is paced by that request's own 429s: the endpoint's budget
-            # does not slow an account read from the header probe first.
-            recent_429 = before is not None and before.recent_429(
-                now, rec.first_asked or "endpoint"
+            # Paced by the 429s of every request this fetch made, those it was
+            # just refused included: the next fetch makes the same ones. An
+            # account read from the header probe alone is not slowed by the
+            # endpoint's budget.
+            asked = rec.asked or ("endpoint",)
+            recent_429 = bool(rec.refused_429) or (
+                before is not None
+                and any(before.recent_429(now, request) for request in asked)
             )
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,

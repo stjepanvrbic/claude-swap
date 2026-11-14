@@ -1986,14 +1986,14 @@ class TestRequestTrail:
             monkeypatch, is_active=False, endpoint=self._429(), probe=self.HEADERS
         )
         assert outcome.error is None
-        assert outcome.first_asked == "endpoint"
+        assert outcome.asked == ("endpoint", "probe")
         assert outcome.refused_429 == ("endpoint",)
 
     def test_an_active_probe_read_asks_the_probe_first(self, monkeypatch):
         outcome = self._fetch(
             monkeypatch, is_active=True, endpoint={"seven_day": None}, probe=self.HEADERS
         )
-        assert outcome.first_asked == "probe"
+        assert outcome.asked == ("probe",)
         assert outcome.refused_429 == ()
 
     def test_a_refused_probe_then_an_endpoint_answer(self, monkeypatch):
@@ -2003,5 +2003,5 @@ class TestRequestTrail:
             probe=self._429("https://api.anthropic.com/v1/messages"),
         )
         assert outcome.error is None
-        assert outcome.first_asked == "probe"
+        assert outcome.asked == ("probe", "endpoint")
         assert outcome.refused_429 == ("probe",)

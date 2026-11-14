@@ -1131,11 +1131,11 @@ class UsageOutcome:
     # permanent auth kind — lets the store bind the strike to that
     # generation (see usage_store.FetchRecord.struck_fp).
     struck_fp: str | None = None
-    # Which usage request this fetch made first ("endpoint" or "probe"), and
-    # every one that answered 429 (rate limited, not a quota refusal), even
-    # when another then succeeded. The two have separate budgets, so each is
-    # paced by its own 429s (see usage_store.FetchRecord).
-    first_asked: str | None = None
+    # The usage requests this fetch made, in order ("endpoint", "probe"), and
+    # those that answered 429 (rate limited, not a quota refusal), even when
+    # another then succeeded. The two have separate budgets, so each is paced
+    # by its own 429s (see usage_store.FetchRecord).
+    asked: tuple[str, ...] = ()
     refused_429: tuple[str, ...] = ()
 
 
@@ -1167,7 +1167,7 @@ class _Requests:
     def tag(self, outcome: "UsageOutcome") -> "UsageOutcome":
         return replace(
             outcome,
-            first_asked=self.asked[0] if self.asked else None,
+            asked=tuple(dict.fromkeys(self.asked)),
             refused_429=tuple(dict.fromkeys(self.refused)),
         )
 

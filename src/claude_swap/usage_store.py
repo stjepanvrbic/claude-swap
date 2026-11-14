@@ -271,13 +271,13 @@ class FetchRecord:
     # persists: later passes skip the request while the credential still
     # carries that token, and a success clears it.
     rejected_fp: str | None = None
-    # The request this fetch made first ("endpoint" or "probe") and those
-    # that answered 429. Each request has its own budget, so a 429 is stamped
-    # per request (``last429At`` / ``lastProbe429At``), even on a fetch that
-    # then succeeded through the other, and the next plan is paced by the
-    # 429s of the request it starts with. Empty from writers that predate
-    # it: their http-429 error stamps the endpoint, as before.
-    first_asked: str | None = None
+    # The usage requests this fetch made ("endpoint", "probe") and those that
+    # answered 429. Each request has its own budget, so a 429 is stamped per
+    # request (``last429At`` / ``lastProbe429At``), even on a fetch that then
+    # succeeded through the other, and the next plan is paced by the 429s of
+    # every request this fetch made. A record built without them reads an
+    # http-429 error as the endpoint's, the store's meaning before them.
+    asked: tuple[str, ...] = ()
     refused_429: tuple[str, ...] = ()
 
 
@@ -354,7 +354,11 @@ class UsageEntry:
         still expires normally. Bounded by ``RECENT_429_WINDOW_S`` past the
         anchor so it clears once the saturated window has aged out.
         """
-        stamp = self.last_probe_429_at if request == "probe" else self.last_429_at
+        stamp, other = (
+            (self.last_probe_429_at, self.last_429_at)
+            if request == "probe"
+            else (self.last_429_at, self.last_probe_429_at)
+        )
         if stamp is None:
             return False
         anchor = stamp
@@ -364,10 +368,13 @@ class UsageEntry:
         # on a token that 429'd long ago would install a fresh backoffUntil and
         # spuriously re-arm the post-429 cadence. Success clears lastError and
         # backoffUntil; only a 429 sets last429At and backoffUntil together.
+        # The live backoff is one per row: it belongs to whichever request
+        # was refused last, so it extends only that request's window.
         if (
             self.last_error == "http-429"
             and self.backoff_until is not None
             and self.backoff_until > anchor
+            and (other is None or stamp >= other)
         ):
             anchor = self.backoff_until
         return now < anchor + RECENT_429_WINDOW_S
@@ -1156,13 +1163,13 @@ class UsageStore:
             rec = outcomes[num]
             row["claimId"] = None
             row["claimUntil"] = 0.0
+            for kind in rec.refused_429:
+                row[_429_STAMP[kind]] = now
             if rec.sentinel is not None:
                 if rec.rejected_fp is not None:
                     row["rejectedFingerprint"] = rec.rejected_fp
                 return
             row["lastAttemptAt"] = now
-            for kind in rec.refused_429:
-                row[_429_STAMP[kind]] = now
             if rec.error is None:
                 row["lastGood"] = rec.usage
                 row["fetchedAt"] = now
