@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -644,12 +645,12 @@ class TestDryRun:
 
 
 _HOLDER = """
-import sys, time
+import os, sys, time
 sys.path.insert(0, sys.argv[2])
 from pathlib import Path
 from claude_swap.locking import InstanceLock
 assert InstanceLock(Path(sys.argv[1]) / "autoswitch.lock").try_acquire()
-print("held", flush=True)
+print(os.getpid(), flush=True)
 time.sleep(120)
 """
 
@@ -661,12 +662,16 @@ class TestOneEngine:
              str(Path(oauth.__file__).resolve().parents[1])],
             stdout=subprocess.PIPE, text=True,
         )
+        holder_pid = int(holder.stdout.readline().strip())
         try:
-            assert holder.stdout.readline().strip() == "held"
             with pytest.raises(EngineBusy) as busy:
                 fleet.engine.run_loop()
-            assert busy.value.pid == holder.pid
+            assert busy.value.pid == holder_pid
         finally:
+            try:
+                os.kill(holder_pid, signal.SIGTERM)
+            except OSError:
+                pass
             holder.kill()
             holder.wait()
 

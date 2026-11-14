@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import sys
 import time
@@ -17,15 +19,33 @@ from claude_swap.settings import load_settings, set_setting
 
 
 HOLDER = """
-import sys, time
+import os, sys, time
 sys.path.insert(0, sys.argv[2])
 from pathlib import Path
 from claude_swap.locking import InstanceLock
 lock = InstanceLock(Path(sys.argv[1]) / "autoswitch.lock")
 assert lock.try_acquire()
-print("held", flush=True)
+print(os.getpid(), flush=True)
 time.sleep(60)
 """
+
+
+class Holder:
+    """A lock-holding process. ``pid`` is the interpreter that holds the
+    lock: on Windows a venv's python.exe is a launcher that runs it as a
+    child, so the Popen pid is not it."""
+
+    def __init__(self, proc: subprocess.Popen, pid: int):
+        self.proc = proc
+        self.pid = pid
+
+    def kill(self) -> None:
+        try:
+            os.kill(self.pid, signal.SIGTERM)  # TerminateProcess on Windows
+        except OSError:
+            pass
+        self.proc.kill()
+        self.proc.wait()
 
 
 @pytest.fixture
@@ -36,10 +56,9 @@ def holder(tmp_path: Path):
         [sys.executable, "-c", HOLDER, str(tmp_path), str(src)],
         stdout=subprocess.PIPE, text=True,
     )
-    assert proc.stdout.readline().strip() == "held"
-    yield proc
-    proc.kill()
-    proc.wait()
+    holder = Holder(proc, int(proc.stdout.readline().strip()))
+    yield holder
+    holder.kill()
 
 
 def _exited_proc() -> Mock:
@@ -71,9 +90,8 @@ def test_a_second_holder_cannot_take_the_lock(tmp_path: Path, holder):
 
 def test_the_lock_frees_when_its_holder_dies(tmp_path: Path, holder):
     holder.kill()
-    holder.wait()
     lock = InstanceLock(tmp_path / "autoswitch.lock")
-    assert lock.try_acquire() is True
+    assert lock.try_acquire(timeout=10) is True
     lock.release()
 
 
@@ -120,7 +138,7 @@ def test_stop_never_kills_a_holder(tmp_path: Path, holder):
     # may be mid-refresh; stop only disables, and says it is still running.
     st = background.stop(tmp_path, timeout=1)
 
-    assert holder.poll() is None
+    assert holder.proc.poll() is None
     assert st.running is True
     assert load_settings(tmp_path).enabled is False
 
