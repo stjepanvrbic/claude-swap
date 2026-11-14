@@ -237,8 +237,7 @@ class TaskScheduler:
 """
 
     def install(self) -> None:
-        user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}"
-        xml = self.render(worker_argv(self.name), user.lstrip("\\"))
+        xml = self.render(worker_argv(self.name), _windows_account())
         self.scratch_dir.mkdir(parents=True, exist_ok=True)
         path = self.scratch_dir / "autoswitch_task.xml"
         path.write_text(xml, encoding="utf-16")
@@ -289,6 +288,22 @@ def manager(backup_root: Path) -> Manager:
         said = (probe.stderr or probe.stdout or "").strip()
         raise Unavailable(f"no systemd user manager to talk to ({said})")
     return SystemdUser()
+
+
+def _windows_account() -> str:
+    """This user as ``DOMAIN\\name`` (``MACHINE\\name`` for a local account),
+    the form Task Scheduler maps to the account. ``USERDOMAIN`` will not do:
+    an SSH session sets it to ``WORKGROUP``."""
+    import ctypes
+
+    name_sam_compatible = 2
+    secur32 = ctypes.WinDLL("secur32")
+    size = ctypes.c_ulong(0)
+    secur32.GetUserNameExW(name_sam_compatible, None, ctypes.byref(size))
+    buffer = ctypes.create_unicode_buffer(size.value)
+    if not secur32.GetUserNameExW(name_sam_compatible, buffer, ctypes.byref(size)):
+        raise ServiceError(f"GetUserNameExW failed: error {ctypes.GetLastError()}")
+    return buffer.value
 
 
 def _forwarded_env() -> dict[str, str]:
