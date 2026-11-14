@@ -27,9 +27,11 @@ WORKER = [sys.executable, "-m", "claude_swap", "auto", "_worker", "--service", "
 
 class TestSystemdUnit:
     def test_runs_the_worker_and_restarts_it_when_it_dies(self, tmp_path: Path):
-        text = service.SystemdUser(unit_dir=tmp_path).render(WORKER, {})
+        text = service.SystemdUser(unit_dir=tmp_path).render(
+            ["/home/me/.local/bin/cswap", "auto", "_worker", "--service", "systemd"], {}
+        )
 
-        assert f'ExecStart="{sys.executable}" "-m" "claude_swap" "auto" "_worker"' in text
+        assert 'ExecStart="/home/me/.local/bin/cswap" "auto" "_worker" "--service" "systemd"\n' in text
         assert "Restart=on-failure\n" in text
         assert "WantedBy=default.target\n" in text
 
