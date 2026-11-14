@@ -237,7 +237,9 @@ def plan_after_fetch(
         interval = default
     elif abs(new_pct - prev_pct) >= MOVEMENT_DELTA_PCT:
         moving = True
-        interval = max(MIN_INTERVAL_S, base / 2)
+        # Capped too: a base left wide by a past 429 run must not let a
+        # moving account wait longer than an idle one.
+        interval = min(ceiling, max(MIN_INTERVAL_S, base / 2))
     else:
         # Floored so a sub-floor base (urgent mode's 60s) snaps straight back
         # to the normal cadence once movement stops, instead of decaying

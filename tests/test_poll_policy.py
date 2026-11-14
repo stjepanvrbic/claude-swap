@@ -433,3 +433,54 @@ class TestPerWindowUrgency:
             self._active(usage(80.0), usage(83.0), threshold=85.0, weekly_threshold=97.0)
             == 270.0
         )
+
+
+class TestCadenceAfterA429Run:
+    """A 429 run on the usage endpoint leaves a wide interval and a recent
+    429 stamp behind. Neither may slow an account read from the header
+    probe, which never spends the endpoint's budget."""
+
+    def test_a_moving_active_account_stays_within_its_ceiling(self):
+        _, interval = _plan(
+            prev_interval_s=1800.0, prev_usage=_usage(10), new_usage=_usage(15),
+            is_active=True,
+        )
+        assert interval == poll_policy.ACTIVE_MAX_INTERVAL_S
+
+    @staticmethod
+    def _plans(temp_home, new_usage: dict) -> float:
+        import time
+
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from claude_swap.usage_store import FetchRecord, UsageEntry
+
+        switcher = ClaudeAccountSwitcher()
+        switcher.set_poll_policy_inputs(95.0, 98.0, ("Fable",))
+        now = time.time()
+        before = UsageEntry(
+            last_good={"seven_day": {"pct": 40.0},
+                       "scoped": [{"name": "Fable", "pct": 86.0}]},
+            fetched_at=now - 300,
+            poll_interval_s=1800.0,
+            last_429_at=now - 600,
+        )
+        info = (2, "a@example.com", "", "", True, "", "")
+        plans = switcher._plans_after_fetch(
+            {"2": FetchRecord(usage=new_usage)}, {"2": before}, {"2": info}
+        )
+        return plans["2"][1]
+
+    def test_a_probe_reading_near_the_line_goes_urgent(self, temp_home):
+        interval = self._plans(temp_home, {
+            "seven_day": {"pct": 42.0},
+            "scoped": [{"name": "Fable", "pct": 90.0}],
+            "source": "headers",
+        })
+        assert interval == poll_policy.URGENT_INTERVAL_S
+
+    def test_an_endpoint_reading_still_honours_the_429_budget(self, temp_home):
+        interval = self._plans(temp_home, {
+            "seven_day": {"pct": 42.0},
+            "scoped": [{"name": "Fable", "pct": 90.0}],
+        })
+        assert interval >= poll_policy.POST_429_MIN_INTERVAL_S

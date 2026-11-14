@@ -5865,7 +5865,15 @@ class ClaudeAccountSwitcher:
             if rec.sentinel is not None or rec.error is not None:
                 continue
             before = pre.get(num)
-            recent_429 = before is not None and before.recent_429(now)
+            # A 429 is the usage endpoint's budget; a reading taken from the
+            # header probe never spent it, so it does not slow the cadence.
+            from_probe = (
+                isinstance(rec.usage, dict)
+                and rec.usage.get("source") == oauth.USAGE_SOURCE_HEADERS
+            )
+            recent_429 = (
+                not from_probe and before is not None and before.recent_429(now)
+            )
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
                 prev_usage=before.last_good if before else None,
