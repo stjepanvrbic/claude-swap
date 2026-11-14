@@ -23,9 +23,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_swap.locking import InstanceLock
 from claude_swap.settings import load_settings, set_setting
 
 PID_FILENAME = "autoswitch_background.pid"
+LOCK_FILENAME = "autoswitch_background.lock"
 LOG_FILENAME = "autoswitch_background.log"
 STDERR_FILENAME = "autoswitch_background.err"
 # A poll line every tick is ~2 MB a day at the 15 s minimum interval, so
@@ -57,6 +59,12 @@ class BackgroundStatus:
 
 def pid_path(backup_root: Path) -> Path:
     return backup_root / PID_FILENAME
+
+
+def worker_lock(backup_root: Path) -> InstanceLock:
+    """Held by the running worker for its lifetime; it writes its own pid to
+    the pid file, so the file names the worker that actually runs."""
+    return InstanceLock(backup_root / LOCK_FILENAME, pid_path(backup_root))
 
 
 def log_path(backup_root: Path) -> Path:
@@ -159,7 +167,7 @@ def status(backup_root: Path) -> BackgroundStatus:
         enabled=settings.enabled,
         paused=settings.paused,
         pid=pid,
-        running=_process_running(pid),
+        running=worker_lock(backup_root).held_elsewhere() or _process_running(pid),
         pid_path=path,
         log_path=log_path(backup_root),
     )

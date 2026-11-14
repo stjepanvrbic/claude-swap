@@ -39,12 +39,16 @@ def test_start_on_windows_uses_hidden_console(tmp_path: Path):
     # child python allocates a visible one; closing it kills the worker.
     proc = Mock(pid=12345)
 
-    with patch("claude_swap.background.sys.platform", "win32"), \
+    # sys.platform is one attribute for every module: patched here it would
+    # send the worker-lock check down the Windows path on this host.
+    with patch("claude_swap.background.worker_lock") as lock, \
+         patch("claude_swap.background.sys.platform", "win32"), \
          patch("claude_swap.background._process_running", return_value=False), \
          patch("subprocess.CREATE_NO_WINDOW", 0x08000000, create=True), \
          patch("subprocess.DETACHED_PROCESS", 0x00000008, create=True), \
          patch("subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True), \
          patch("subprocess.Popen", return_value=proc) as popen:
+        lock.return_value.held_elsewhere.return_value = False
         background.start(tmp_path)
 
     flags = popen.call_args.kwargs["creationflags"]

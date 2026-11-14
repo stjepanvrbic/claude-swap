@@ -62,10 +62,10 @@ _logger = logging.getLogger("claude-swap")
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 PLAN_FILENAME = "subscription_plans.json"
 
-# Plans change on a billing cadence, not a usage one. Six hours keeps a lapse
-# visible the same day without adding meaningful traffic: one profile call per
-# account four times a day.
-PLAN_TTL_S = 6 * 3600
+# Plans change on a billing cadence, but a lapse can be fixed within minutes
+# (a failed payment retried), and the stale label then misleads for as long
+# as it is cached. An hour is one profile call per account per hour.
+PLAN_TTL_S = 3600
 
 # After a failed read: at least this long, longer if the server says so. A
 # Retry-After of 0 is real on this API (#220), so it cannot be the only floor.

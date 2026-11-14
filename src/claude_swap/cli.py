@@ -1049,6 +1049,16 @@ def _auto_worker_command(argv: list[str]) -> None:
             emit.write("auto-switch background disabled; worker exiting")
             sys.exit(0)
 
+        # One worker per backup root, whoever started it (systemd, a login
+        # task, `cswap auto start`): a second one leaves at once.
+        lock = background.worker_lock(root)
+        if not lock.try_acquire(timeout=3.0):
+            emit.write(
+                f"another auto-switch worker holds the lock; worker "
+                f"{os.getpid()} exiting"
+            )
+            sys.exit(0)
+
         engine = AutoSwitchEngine(switcher, settings, emit)
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         weekly = (
@@ -1061,12 +1071,14 @@ def _auto_worker_command(argv: list[str]) -> None:
             f"{pct_label(settings.threshold)}%{weekly}, strategy "
             f"{settings.strategy}, every {settings.interval_seconds:.0f}s"
         )
-        sys.exit(
-            engine.run_loop(
+        try:
+            code = engine.run_loop(
                 settings_loader=lambda: reload_settings(root),
                 should_continue=lambda current: current.enabled,
             )
-        )
+        finally:
+            lock.release()
+        sys.exit(code)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
