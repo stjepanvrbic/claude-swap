@@ -993,6 +993,11 @@ Examples:
         pid = f", pid {st.pid}" if st.pid and st.running else ""
         print(f"auto-switch background: {enabled}, {state}{pid}")
         print(dimmed(f"log: {st.log_path}"))
+        if st.ends_with_caller:
+            warning(
+                "This session's job object keeps the worker, so it stops "
+                "when this session ends."
+            )
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)

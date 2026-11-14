@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -1407,13 +1408,20 @@ class TestSetupTokenHeaderProbeWiring:
         assert _format_usage_lines(rejected)[-1] == "limit: reached"
 
     def test_a_refusal_a_window_at_its_limit_explains_adds_no_row(self):
+        reset = datetime.fromtimestamp(time.time() + 86400, tz=timezone.utc).isoformat()
         fable_out = {
             "seven_day": {"pct": 64.0},
-            "scoped": [{"name": "Fable", "pct": 100.0}],
-            "rejected": {"retry_after_s": None, "resets_at": None},
+            "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": reset}],
+            "rejected": {"retry_after_s": None, "resets_at": reset},
             "source": oauth.USAGE_SOURCE_HEADERS,
         }
-        assert _format_usage_lines(fable_out) == ["7d:     64%", "Fable: 100%  (!)"]
+        lines = _format_usage_lines(fable_out)
+        assert lines[-1].startswith("Fable: 100%   resets")
+        assert not any(line.startswith("limit:") for line in lines)
+
+        # Without the window's reset, the refusal is where the time is.
+        del fable_out["scoped"][0]["resets_at"]
+        assert _format_usage_lines(fable_out)[-1].startswith("limit: reached   until")
 
 
 class TestAdoptSessionCredential:
@@ -1645,9 +1653,12 @@ class TestListAccountsUsage:
                 switcher.list_accounts()
             return capsys.readouterr().out
 
-        down = "worker is not running"
+        down = "background worker is not running"
         assert down not in listed()
         set_setting(switcher.backup_dir, "autoswitch.enabled", "true")
+        assert down in listed()
+        # A killed worker's pid file outlives it, and the pid gets reused.
+        background.pid_path(switcher.backup_dir).write_text(f"{os.getpid()}\n")
         assert down in listed()
         lock = background.worker_lock(switcher.backup_dir)
         assert lock.try_acquire(timeout=1.0)

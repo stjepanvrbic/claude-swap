@@ -6276,11 +6276,13 @@ class ClaudeAccountSwitcher:
         # in the JSON payload and logs for diagnostics.
         dup_warnings = self._duplicate_account_warnings(accounts_info)
         lockstep_warnings = self._lockstep_usage_warnings(accounts_info, entries)
-        auto_switch = background.status(self.backup_dir)
+        # The lock, not the pid file: a killed worker leaves its pid behind,
+        # and Windows soon hands that pid to another process.
         worker_warnings = (
-            ["Auto-switch is on but its worker is not running, so nothing "
-             "switches accounts. Start it: cswap auto start"]
-            if auto_switch.enabled and not auto_switch.running
+            ["Auto-switch is on but its background worker is not running. "
+             "Start it: cswap auto start"]
+            if load_settings(self.backup_dir).enabled
+            and not background.worker_lock(self.backup_dir).held_elsewhere()
             else []
         )
         if dup_warnings or lockstep_warnings or worker_warnings:

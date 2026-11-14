@@ -20,13 +20,11 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from claude_swap.locking import InstanceLock
 from claude_swap.settings import load_settings, set_setting
-
-_logger = logging.getLogger("claude-swap")
 
 PID_FILENAME = "autoswitch_background.pid"
 LOCK_FILENAME = "autoswitch_background.lock"
@@ -50,9 +48,12 @@ class BackgroundStatus:
     pid_path: Path
     log_path: Path
     paused: bool = False
+    # Set by `start` when the worker had to stay in the caller's job object:
+    # it then ends with the session that started it.
+    ends_with_caller: bool = False
 
     def to_json(self) -> dict:
-        return {
+        out = {
             "enabled": self.enabled,
             "paused": self.paused,
             "pid": self.pid,
@@ -60,6 +61,9 @@ class BackgroundStatus:
             "pidPath": str(self.pid_path),
             "logPath": str(self.log_path),
         }
+        if self.ends_with_caller:
+            out["endsWithCaller"] = True
+        return out
 
 
 def pid_path(backup_root: Path) -> Path:
@@ -210,6 +214,7 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
     else:
         popen_kwargs["start_new_session"] = True
 
+    ends_with_caller = False
     with open(err, err_mode, buffering=0) as err_file:
         for attempt, creationflags in enumerate(launch_flags, start=1):
             try:
@@ -227,20 +232,16 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
             except PermissionError:
                 if attempt == len(launch_flags):
                     raise
-                _logger.warning(
-                    "This session's job object keeps its processes: the "
-                    "auto-switch worker stops when this session ends."
-                )
+                ends_with_caller = True
     # The worker writes its own pid once it holds the lock: the launched
     # process may be a launcher (a Windows venv's python.exe), or a duplicate
     # that leaves at once. Report what happened rather than what was spawned.
     deadline = time.monotonic() + START_WAIT_S
     while time.monotonic() < deadline:
-        st = status(backup_root)
         if worker_lock(backup_root).held_elsewhere() or proc.poll() is not None:
-            return st
+            break
         time.sleep(0.1)
-    return status(backup_root)
+    return replace(status(backup_root), ends_with_caller=ends_with_caller)
 
 
 def stop(
