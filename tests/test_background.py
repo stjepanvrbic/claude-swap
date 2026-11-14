@@ -210,12 +210,23 @@ def test_start_retires_a_worker_from_a_build_before_the_lock(tmp_path: Path):
     )
     assert legacy.stdout.readline().strip() == "up"
     (tmp_path / background.PID_FILENAME).write_text(f"{legacy.pid}\n")
+    real_popen = subprocess.Popen
+    spawned = []
+
+    def popen(args, **kwargs):
+        # Only the worker launch is faked: on macOS the old-worker check
+        # itself runs `ps` through subprocess.
+        if args[-3:] == ["claude_swap", "auto", "_worker"]:
+            spawned.append(args)
+            return _exited_proc()
+        return real_popen(args, **kwargs)
+
     try:
-        with patch("subprocess.Popen", return_value=_exited_proc()) as popen:
+        with patch("subprocess.Popen", side_effect=popen):
             background.start(tmp_path)
 
         assert legacy.wait(timeout=30) is not None
-        popen.assert_called_once()
+        assert len(spawned) == 1
         assert load_settings(tmp_path).enabled is True
         assert not (tmp_path / background.PID_FILENAME).exists()
     finally:
