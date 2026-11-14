@@ -1054,7 +1054,13 @@ def _auto_worker_command(argv: list[str]) -> None:
     parser.add_argument("--debug", action="store_true")
     # The service manager running this worker (see claude_swap.service).
     parser.add_argument("--service")
+    # KEY=VALUE from the shell that set the service up: a scheduled task
+    # carries no environment of its own.
+    parser.add_argument("--env", action="append", default=[])
     args = parser.parse_args(argv)
+    for assignment in args.env:
+        key, _, value = assignment.partition("=")
+        os.environ[key] = value
 
     from claude_swap import background
     from claude_swap.autoswitch import AutoSwitchEngine, pct_label
@@ -1071,14 +1077,25 @@ def _auto_worker_command(argv: list[str]) -> None:
             sys.exit(0)
 
         # One worker per backup root, whoever started it (systemd, a login
-        # task, `cswap auto start`): a second one leaves at once.
+        # task, `cswap auto start`): a second one leaves at once, except
+        # the service's, which waits to take over when the other one ends.
         lock = background.worker_lock(root)
         if not lock.try_acquire(timeout=3.0):
+            if not args.service:
+                emit.write(
+                    f"another auto-switch worker holds the lock; worker "
+                    f"{os.getpid()} exiting"
+                )
+                sys.exit(0)
             emit.write(
-                f"another auto-switch worker holds the lock; worker "
-                f"{os.getpid()} exiting"
+                f"another auto-switch worker holds the lock; the {args.service} "
+                f"worker {os.getpid()} takes over when it ends"
             )
-            sys.exit(0)
+            while not lock.try_acquire(timeout=5.0):
+                if not reload_settings(root).enabled:
+                    emit.write("auto-switch background disabled; worker exiting")
+                    sys.exit(0)
+            settings = load_settings(root)
 
         if args.service:
             # A service manager keeps no console: a crash traceback goes to
@@ -1107,6 +1124,11 @@ def _auto_worker_command(argv: list[str]) -> None:
         finally:
             background.clear_supervised(root)
             lock.release()
+        if args.service and code == 0 and reload_settings(root).enabled:
+            # Stopped while auto-switch is on (a signal not from the service
+            # manager): a failure to the manager, so it starts the worker again.
+            emit.write("worker stopped while auto-switch is on; the service starts it again")
+            code = 1
         sys.exit(code)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")

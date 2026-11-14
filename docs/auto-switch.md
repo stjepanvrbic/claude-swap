@@ -68,7 +68,8 @@ Only one background worker runs per backup directory: a second one, however it w
 
 - **Linux:** a systemd user unit, `~/.config/systemd/user/cswap-auto.service`, restarted 10 seconds after the worker dies. It carries the profile variables (`CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`) and proxy settings of the shell that started it, so it manages the same accounts. With lingering off (`loginctl enable-linger`), systemd stops it when you log out. Change it with `systemctl --user edit cswap-auto`, since `cswap auto start` rewrites the file.
 - **Windows:** a Task Scheduler task, `cswap auto-switch`, that runs the worker in your logon session with no console window. It starts at logon and again every two minutes. A run while the worker is alive does nothing, so a dead worker is back within two minutes; the task's own restart-on-failure does not fire when the worker is killed. If the task does not start the worker (no one is logged on at the PC), `cswap auto start` also launches one detached, and the task takes over when that one ends.
-- **A worker the service did not start** (an older cswap, `--debug`) gives way to the service's on the next `cswap auto start`. `cswap auto status` says when the running worker is not the service's.
+- **A worker the service did not start** (an older cswap, `--debug`) gives way to the service's on the next `cswap auto start`; until then the service's worker waits and takes over when that one ends. `cswap auto status` says when the running worker is not the service's.
+- **Profile:** on Windows the task carries the starting shell's profile and proxy variables as worker arguments, since a task has no environment of its own.
 - `cswap auto stop` disables the unit or task, so it stays stopped across logins until `cswap auto start`.
 
 ## When something fails

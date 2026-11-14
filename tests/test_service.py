@@ -98,6 +98,24 @@ class TestScheduledTask:
         assert task.find("t:Triggers/t:TimeTrigger/t:Repetition/t:Duration", NS) is None
         assert task.findtext("t:Settings/t:MultipleInstancesPolicy", namespaces=NS) == "IgnoreNew"
 
+    def test_carries_the_starting_shells_profile(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", r"C:\profiles\work")
+        registered = []
+
+        def run(argv):
+            if argv[1] == "/Create":
+                registered.append(Path(argv[5]).read_text(encoding="utf-16"))
+            return Mock(returncode=0, stdout="", stderr="")
+
+        with patch.object(service, "_run", side_effect=run), \
+             patch.object(service, "_windows_account", return_value=r"PC\me"), \
+             patch.object(service, "worker_argv", return_value=[r"C:\bin\cswap.exe", "auto", "_worker"]):
+            service.TaskScheduler(tmp_path).install()
+
+        task = ET.fromstring(registered[0].split("\n", 1)[1])
+        arguments = task.findtext("t:Actions/t:Exec/t:Arguments", namespaces=NS)
+        assert arguments.endswith(r" --env=CLAUDE_CONFIG_DIR=C:\profiles\work")
+
     @pytest.mark.real_service_manager
     @pytest.mark.skipif(sys.platform != "win32", reason="Task Scheduler is Windows-only")
     def test_task_scheduler_accepts_the_task(self, tmp_path: Path):

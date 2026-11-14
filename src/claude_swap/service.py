@@ -237,7 +237,8 @@ class TaskScheduler:
 """
 
     def install(self) -> None:
-        xml = self.render(worker_argv(self.name), _windows_account())
+        env = [f"--env={key}={value}" for key, value in sorted(_forwarded_env().items())]
+        xml = self.render([*worker_argv(self.name), *env], _windows_account())
         self.scratch_dir.mkdir(parents=True, exist_ok=True)
         path = self.scratch_dir / "autoswitch_task.xml"
         path.write_text(xml, encoding="utf-16")
