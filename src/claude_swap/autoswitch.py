@@ -41,6 +41,7 @@ import enum
 import json
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -94,6 +95,12 @@ DEAD_LOGIN_CHECK_S = 600.0
 
 # Longest sleep between ticks while waiting for a reset.
 MAX_SLEEP_S = 600.0
+
+# How long a starting engine waits for the lock: another process's holder
+# only briefly (a status check takes it for an instant), an earlier engine of
+# this same process until its last tick is over.
+LOCK_WAIT_S = 3.0
+SAME_PROCESS_LOCK_WAIT_S = 180.0
 
 # A login ends at a fixed time (only a fresh /login replaces it). Leave the
 # active account this long before, and never land on one ending sooner than
@@ -580,17 +587,20 @@ class AutoSwitchEngine:
         self._sleep_until: float | None = None
         self._last_decision: tuple[str, str] | None = None
         self._verify_failed_at: dict[str, float] = {}
+        self._last_active_endpoint: float | None = None
+        self._model_check_done = False
 
     @property
     def _models(self) -> tuple[str, ...]:
         return parse_model_names(self.settings.model)
 
     def _hold_s(self, number: str) -> float:
-        """How long a reading keeps other surfaces from fetching the account:
-        until the engine's own next read of it, with slack."""
+        """How long a reading keeps other surfaces from fetching the account.
+        An inactive account's hold ends just before the engine's own next
+        read, which goes through the same collector and would be refused."""
         if number == self._active_number:
             return 2 * self.settings.active_interval_seconds
-        return self.settings.account_interval_seconds + 120.0
+        return max(self.settings.account_interval_seconds - 60.0, 60.0)
 
     # -- state file ---------------------------------------------------------
 
@@ -728,6 +738,12 @@ class AutoSwitchEngine:
             return False
         self._last_active_attempt = now
         reading = self.reader.read_active(view.number)
+        if reading.ok and self._needs_endpoint() and (
+            self._last_active_endpoint is None
+            or now - self._last_active_endpoint >= self.settings.account_interval_seconds
+        ) and not (view.backoff_until is not None and now < view.backoff_until):
+            self._last_active_endpoint = now
+            self.reader.read_active_endpoint(view.number)
         if reading.error != "token-expired":
             self._token_expired_since = None
             if reading.ok:
@@ -742,6 +758,40 @@ class AutoSwitchEngine:
             self._last_login_check = now
             self._active_login_dead = self._active_login_is_dead(view.number)
         return True
+
+    def _needs_endpoint(self) -> bool:
+        """Whether a per-model window gates switching that only the usage
+        endpoint reports (the probe reports Fable's alone)."""
+        return any(m.lower() != "fable" for m in self._models)
+
+    def _check_models(self, views: dict[str, AccountView]) -> None:
+        """Once every account has a reading, warn about a configured model
+        name that no account reports: it would gate nothing, silently."""
+        names = [m for m in self._models if m.lower() != "all"]
+        if self._model_check_done or not names:
+            return
+        readings = [
+            v.usage for v in views.values()
+            if v.in_rotation and not v.dead and v.kind != "api_key"
+        ]
+        if not readings or any(u is None for u in readings):
+            return
+        self._model_check_done = True
+        reported = {
+            w["name"].lower()
+            for u in readings
+            for w in u.get("scoped") or ()
+            if isinstance(w, dict) and isinstance(w.get("name"), str)
+        }
+        missing = [m for m in names if m.lower() not in reported]
+        if missing:
+            self._emit(ErrorEvent(
+                message=(
+                    f"autoswitch.model {', '.join(missing)} matches no per-model "
+                    "window any account reports, so it gates nothing"
+                ),
+                transient=False,
+            ))
 
     def _active_login_is_dead(self, number: str) -> bool:
         """Let the switcher refresh the lapsed live token under Claude Code's
@@ -846,6 +896,7 @@ class AutoSwitchEngine:
             views = self._views(quarantined)
             active = views[current]
             self._emit_poll(views, active, now)
+            self._check_models(views)
 
         if active.kind == "api_key" and not settings.include_api_key_accounts:
             self._decide_hold("active-api-key", "API-key accounts have no quota to watch", read)
@@ -909,7 +960,11 @@ class AutoSwitchEngine:
     def _rank_key(self, view: AccountView, now: float) -> tuple:
         windows = self._windows(view, now)
         room = headroom(windows)
-        ultra = view.usage is not None and not oauth.has_five_hour_window(view.usage)
+        ultra = (
+            isinstance(view.usage, dict)
+            and isinstance(view.usage.get("seven_day"), dict)
+            and not oauth.has_five_hour_window(view.usage)
+        )
         reset = weekly_reset_at(windows, now)
         return (
             -view.priority,
@@ -950,10 +1005,11 @@ class AutoSwitchEngine:
 
         budget = [MAX_VERIFY_PER_TICK]
         min_room = settings.min_headroom_pct
+        login_short = {v.number for v in candidates if self._login_short(v.number)}
         roomy = [
             v
             for v in candidates
-            if not self._login_short(v.number)
+            if v.number not in login_short
             and ((room := headroom(self._windows(v, now))) is None or room >= min_room)
         ]
         outcome = self._land(roomy, active, trigger, now, budget, min_room)
@@ -970,23 +1026,41 @@ class AutoSwitchEngine:
             )
             return TickOutcome.BLOCKED
 
-        # The active account cannot serve: any account with room beats none,
-        # the one with the most room first.
+        # The active account cannot serve, or soon cannot: any account with
+        # room beats none, the one with the most room first, a login that
+        # lasts before one that is ending too. Leaving an ending login for
+        # another ending one gains nothing and would bounce straight back.
         fallback = sorted(
-            (v for v in candidates if not is_refused(self._windows(v, now))),
-            key=lambda v: max((w.pct for w in self._windows(v, now)), default=0.0),
+            (
+                v
+                for v in candidates
+                if not is_refused(self._windows(v, now))
+                and not (trigger == "login-expiring" and v.number in login_short)
+            ),
+            key=lambda v: (
+                v.number in login_short,
+                max((w.pct for w in self._windows(v, now)), default=0.0),
+            ),
         )
         outcome = self._land(fallback, active, trigger, now, budget, None)
         if outcome is not None:
             return outcome
+        if budget[0] <= 0:
+            self._decide_hold("verifying", "more targets to confirm next tick", True)
+            return TickOutcome.BLOCKED
         if settings.include_api_key_accounts:
             for v in views.values():
                 if v.kind == "api_key" and v.in_rotation and v.number != active.number:
                     return self._perform(v, active, trigger)
-
-        if budget[0] <= 0:
-            self._decide_hold("verifying", "more targets to confirm next tick", True)
+        if trigger == "login-expiring":
+            self._decide_hold(
+                "no-target",
+                "no account with a login that lasts has room; staying until "
+                "this login ends",
+                read,
+            )
             return TickOutcome.BLOCKED
+
         earliest = min(
             (
                 t
@@ -1024,6 +1098,13 @@ class AutoSwitchEngine:
         for view in targets:
             if budget[0] <= 0:
                 return None
+            if self.dry_run:
+                # A dry run never refreshes a stored login or spends a
+                # request on an account it is not on: it decides on what it
+                # last read.
+                if self._qualifies(self._windows(view, now), min_room):
+                    return self._perform(view, active, trigger)
+                continue
             failed_at = self._verify_failed_at.get(view.number)
             if failed_at is not None and now - failed_at < VERIFY_RETRY_S:
                 continue
@@ -1040,17 +1121,20 @@ class AutoSwitchEngine:
                 self._verify_failed_at[view.number] = now
                 continue
             self._verify_failed_at.pop(view.number, None)
-            windows = self._windows(view, self.clock(), reading.usage)
-            room = headroom(windows)
-            if room is None:
-                continue
-            if min_room is None:
-                if is_refused(windows):
-                    continue
-            elif room < min_room:
-                continue
-            return self._perform(view, active, trigger)
+            if self._qualifies(self._windows(view, self.clock(), reading.usage), min_room):
+                return self._perform(view, active, trigger)
         return None
+
+    @staticmethod
+    def _qualifies(windows: list[Window], min_room: float | None) -> bool:
+        """Room enough to land: ``min_room`` under every line, or with
+        ``min_room`` None, no window at 100%."""
+        room = headroom(windows)
+        if room is None:
+            return False
+        if min_room is None:
+            return not is_refused(windows)
+        return room >= min_room
 
     def _freshen(self, view: AccountView) -> str | None:
         """The target's access token, refreshed first when it expires soon.
@@ -1112,14 +1196,15 @@ class AutoSwitchEngine:
         self, target: AccountView, active: AccountView, trigger: str
     ) -> TickOutcome:
         if self.dry_run:
-            self._emit(
-                SwitchEvent(
-                    trigger=trigger,
-                    from_ref=active.ref(),
-                    to_ref=target.ref(),
-                    dry_run=True,
+            if self._last_decision != ("switch", target.number):
+                self._emit(
+                    SwitchEvent(
+                        trigger=trigger,
+                        from_ref=active.ref(),
+                        to_ref=target.ref(),
+                        dry_run=True,
+                    )
                 )
-            )
             self._last_decision = ("switch", target.number)
             return TickOutcome.SWITCHED
         with self._state_lock():
@@ -1213,9 +1298,12 @@ class AutoSwitchEngine:
         self.settings = replace(self.settings, threshold=threshold)
 
     def apply_settings(self, settings: AutoSwitchSettings) -> None:
-        """Adopt reloaded settings mid-run; the probe model stays as built."""
+        """Adopt reloaded settings mid-run, the probe model included."""
         if settings != self.settings:
+            if settings.model != self.settings.model:
+                self._model_check_done = False
             self.settings = settings
+            self.reader.probe_model = probe_model_for(settings)
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds
@@ -1240,11 +1328,9 @@ class AutoSwitchEngine:
         """
         lock = None
         if not self.dry_run:
-            lock = InstanceLock(self.switcher.backup_dir / LOCK_FILENAME)
-            if not lock.try_acquire():
-                busy = EngineBusy(lock.holder_pid())
-                self._emit(ErrorEvent(message=str(busy), transient=False))
-                raise busy
+            lock = self._take_lock()
+            if lock is None:
+                return 0
         try:
             while True:
                 self._wake.clear()
@@ -1268,6 +1354,24 @@ class AutoSwitchEngine:
         finally:
             if lock is not None:
                 lock.release()
+
+    def _take_lock(self) -> InstanceLock | None:
+        """The data directory's engine lock, or None when this engine was
+        stopped while waiting. A holder in another process gets a few seconds
+        (a status check holds it for an instant); an earlier engine of this
+        process (a TUI or menu bar restart) gets until its tick ends."""
+        lock = InstanceLock(self.switcher.backup_dir / LOCK_FILENAME)
+        started = time.monotonic()
+        while not lock.try_acquire(timeout=0.2):
+            if self._stop.is_set():
+                return None
+            holder = lock.holder_pid()
+            limit = SAME_PROCESS_LOCK_WAIT_S if holder == os.getpid() else LOCK_WAIT_S
+            if time.monotonic() - started >= limit:
+                busy = EngineBusy(holder)
+                self._emit(ErrorEvent(message=str(busy), transient=False))
+                raise busy
+        return lock
 
     def _reload_settings(
         self,

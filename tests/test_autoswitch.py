@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
+import threading
+import time
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,12 +63,13 @@ class Account:
     account (no 5-hour window)."""
 
     def __init__(self, *, seven_day=0.0, fable=0.0, five_hour=None,
-                 weekly_reset=NOW + 3 * DAY, refused=False):
+                 weekly_reset=NOW + 3 * DAY, refused=False, opus=None):
         self.seven_day = seven_day
         self.fable = fable
         self.five_hour = five_hour
         self.weekly_reset = weekly_reset
         self.refused = refused
+        self.opus = opus  # a per-model window only the endpoint reports
 
     def endpoint_body(self) -> dict:
         body = {
@@ -79,6 +84,13 @@ class Account:
         }
         if self.five_hour is not None:
             body["five_hour"] = {"utilization": self.five_hour, "resets_at": _iso(NOW + 2 * HOUR)}
+        if self.opus is not None:
+            body["limits"].append({
+                "kind": "weekly_scoped",
+                "scope": {"model": {"display_name": "Opus"}},
+                "percent": self.opus,
+                "resets_at": _iso(self.weekly_reset),
+            })
         return body
 
     def probe_headers(self, model: str) -> dict:
@@ -475,15 +487,221 @@ class TestDeadLogins:
         )
 
 
+class TestEndingLogins:
+    def _login(self, fleet, number: int, left_s: float) -> None:
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": f"sk-{number}", "refreshToken": f"rt-{number}",
+            "expiresAt": int((fleet.clock.now + left_s) * 1000),
+            "refreshTokenExpiresAt": int((fleet.clock.now + left_s) * 1000),
+        }})
+        fleet.switcher._write_account_credentials(str(number), fleet.email(number), creds)
+        if number == fleet.active():
+            (fleet.home / ".claude" / ".credentials.json").write_text(creds)
+
+    def test_an_ending_login_moves_to_one_that_lasts(self, fleet):
+        for n in (1, 2, 3, 4):
+            fleet.set(n, fable=10)
+        self._login(fleet, 1, 10 * 60)
+        self._login(fleet, 2, 10 * 60)
+
+        fleet.tick()
+
+        assert fleet.active() in (3, 4)
+        assert fleet.switches()[-1].trigger == "login-expiring"
+
+    def test_two_ending_logins_do_not_bounce(self, temp_home, network):
+        fleet = Fleet(temp_home, network, n=2, cooldown_seconds=300.0)
+        fleet.set(1, fable=10)
+        fleet.set(2, fable=10)
+        self._login(fleet, 1, 14 * 60)
+        self._login(fleet, 2, 14 * 60)
+
+        for _ in range(4):
+            fleet.tick()
+            fleet.clock.advance(15)
+
+        assert fleet.switches() == []
+        assert fleet.active() == 1
+        assert "no-target" in fleet.holds()
+
+
+class TestSessionOwnedAccounts:
+    def test_an_account_a_cswap_run_session_owns_is_never_refreshed(
+        self, fleet, monkeypatch
+    ):
+        for n in (1, 2, 3, 4):
+            fleet.set(n, fable=10)
+        expired = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2", "refreshToken": "rt-2",
+            "expiresAt": int((fleet.clock.now - 60) * 1000),
+        }})
+        fleet.switcher._write_account_credentials("2", fleet.email(2), expired)
+        monkeypatch.setattr(
+            fleet.switcher, "_live_session_pids",
+            lambda num, email: [4242] if num == "2" else [],
+        )
+        consumed: list[str] = []
+        monkeypatch.setattr(
+            fleet.switcher, "consume_backup_grant",
+            lambda num, *a: consumed.append(num),
+        )
+
+        fleet.read_all()
+        fleet.set(1, fable=99)
+        fleet.clock.advance(60)
+        fleet.tick()
+
+        assert "2" not in consumed
+        assert fleet.active() != 2
+
+
+class TestSettingsReload:
+    def test_naming_fable_later_switches_the_probe_to_fable(self, temp_home, network):
+        fleet = Fleet(temp_home, network, model=None)
+        assert fleet.engine.reader.probe_model == oauth.USAGE_PROBE_MODEL
+
+        fleet.engine.apply_settings(fleet.settings.__class__(
+            **{**fleet.settings.__dict__, "model": "Fable"}
+        ))
+
+        assert fleet.engine.reader.probe_model == oauth.FABLE_PROBE_MODEL
+
+
+class TestRanking:
+    def test_a_refusal_only_reading_is_not_taken_for_ultra(self, fleet):
+        # 2's last reading is a refusal that has since ended: no windows at
+        # all, which once read as "no 5-hour window", so Ultra.
+        fleet.set(1, fable=97)
+        fleet.set(2, five_hour=0, fable=0, weekly_reset=NOW + 6 * DAY)
+        fleet.set(3, fable=100)
+        fleet.set(4, five_hour=0, fable=0, weekly_reset=NOW + DAY)
+        fleet.read_all()
+        store = fleet.switcher.usage_store()
+        ids = fleet.switcher.usage_identities(["2"])
+        store.adopt({"2": ({"rejected": {"resets_at": _iso(NOW + 60)}}, 0.0)}, ids)
+        fleet.clock.advance(120)
+        fleet.set(1, fable=99)
+
+        fleet.tick()
+
+        assert fleet.active() == 4
+
+
+class TestEndpointOnlyWindows:
+    def test_an_opus_line_is_watched_through_the_endpoint(self, temp_home, network):
+        fleet = Fleet(temp_home, network, model="Fable,Opus")
+        fleet.set(1, fable=10, opus=50)
+        for n in (2, 3, 4):
+            fleet.set(n, fable=0, opus=0)
+        fleet.read_all()
+        assert fleet.switches() == []
+        fleet.set(1, fable=10, opus=99)
+
+        for _ in range(int(fleet.settings.account_interval_seconds / 15) + 2):
+            fleet.clock.advance(15)
+            fleet.tick()
+            if fleet.switches():
+                break
+
+        assert fleet.active() != 1
+        assert fleet.switches()[-1].trigger == "threshold"
+
+    def test_a_model_no_account_reports_is_named_once(self, temp_home, network):
+        fleet = Fleet(temp_home, network, model="Fabel")
+        for n in (1, 2, 3, 4):
+            fleet.set(n)
+        fleet.read_all()
+        fleet.clock.advance(60)
+        fleet.tick()
+
+        warnings = [e for e in fleet.events if e.kind == "error" and "Fabel" in e.message]
+        assert len(warnings) == 1
+
+
+class TestDryRun:
+    def test_a_dry_run_spends_nothing_on_the_target(self, fleet, network, monkeypatch):
+        fleet.engine = fleet.make_engine(dry_run=True)
+        fleet.set(1, fable=97)
+        for n in (2, 3, 4):
+            fleet.set(n, fable=0)
+        fleet.read_all()
+        consumed = []
+        monkeypatch.setattr(
+            fleet.switcher, "consume_backup_grant", lambda *a: consumed.append(a)
+        )
+        network.probe_calls.clear()
+        fleet.set(1, fable=99)
+
+        for _ in range(3):
+            fleet.clock.advance(20)
+            fleet.tick()
+
+        assert consumed == []
+        assert set(network.probed()) == {"sk-1"}
+        would = [e for e in fleet.events if isinstance(e, SwitchEvent)]
+        assert len(would) == 1 and would[0].dry_run
+        assert fleet.active() == 1
+
+
+_HOLDER = """
+import sys, time
+sys.path.insert(0, sys.argv[2])
+from pathlib import Path
+from claude_swap.locking import InstanceLock
+assert InstanceLock(Path(sys.argv[1]) / "autoswitch.lock").try_acquire()
+print("held", flush=True)
+time.sleep(120)
+"""
+
+
 class TestOneEngine:
     def test_a_second_live_engine_refuses_to_run(self, fleet):
-        held = InstanceLock(fleet.switcher.backup_dir / LOCK_FILENAME)
-        assert held.try_acquire()
+        holder = subprocess.Popen(
+            [sys.executable, "-c", _HOLDER, str(fleet.switcher.backup_dir),
+             str(Path(oauth.__file__).resolve().parents[1])],
+            stdout=subprocess.PIPE, text=True,
+        )
         try:
-            with pytest.raises(EngineBusy):
+            assert holder.stdout.readline().strip() == "held"
+            with pytest.raises(EngineBusy) as busy:
                 fleet.engine.run_loop()
+            assert busy.value.pid == holder.pid
         finally:
-            held.release()
+            holder.kill()
+            holder.wait()
+
+    def test_a_restarted_engine_in_the_same_process_takes_over(self, fleet):
+        for n in (1, 2, 3, 4):
+            fleet.set(n, fable=10)
+        first = fleet.make_engine()
+        second = fleet.make_engine()
+        errors: list[BaseException] = []
+
+        def run(engine):
+            try:
+                engine.run_loop()
+            except BaseException as e:  # noqa: BLE001 - reported below
+                errors.append(e)
+
+        t1 = threading.Thread(target=run, args=(first,))
+        t1.start()
+        lock = InstanceLock(fleet.switcher.backup_dir / LOCK_FILENAME)
+        deadline = time.monotonic() + 30
+        while not lock.held_elsewhere() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        t2 = threading.Thread(target=run, args=(second,))
+        t2.start()
+        time.sleep(0.5)
+        first.stop()
+        t1.join(timeout=30)
+        deadline = time.monotonic() + 30
+        while (second._last_decision is None) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        second.stop()
+        t2.join(timeout=30)
+
+        assert errors == []
+        assert second._last_decision is not None
 
     def test_a_dry_run_engine_runs_beside_a_live_one(self, fleet):
         held = InstanceLock(fleet.switcher.backup_dir / LOCK_FILENAME)

@@ -992,6 +992,11 @@ Examples:
         enabled = "enabled" if st.enabled else "disabled"
         pid = f", pid {st.pid}" if st.pid and st.running else ""
         print(f"auto-switch background: {enabled}, {state}{pid}")
+        if verb == "stop" and st.running:
+            warning(
+                "still running: a tick in progress finishes first, and a "
+                "foreground 'cswap auto' or the TUI has to be stopped where it runs"
+            )
         print(dimmed(f"log: {st.log_path}"))
 
     try:

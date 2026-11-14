@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -11,6 +12,7 @@ import pytest
 
 from claude_swap import background
 from claude_swap.locking import InstanceLock
+from claude_swap.paths import get_backup_root
 from claude_swap.settings import load_settings, set_setting
 
 
@@ -113,12 +115,94 @@ def test_start_on_windows_uses_hidden_console(tmp_path: Path):
     assert not flags & 0x00000008
 
 
-def test_stop_ends_the_lock_holder_and_disables(tmp_path: Path, holder):
-    st = background.stop(tmp_path, timeout=10)
+def test_stop_never_kills_a_holder(tmp_path: Path, holder):
+    # A foreground `cswap auto` or the TUI holds the lock the same way and
+    # may be mid-refresh; stop only disables, and says it is still running.
+    st = background.stop(tmp_path, timeout=1)
 
-    assert holder.wait(timeout=10) is not None
-    assert st.running is False
+    assert holder.poll() is None
+    assert st.running is True
     assert load_settings(tmp_path).enabled is False
+
+
+@pytest.fixture
+def worker_root(tmp_path: Path, monkeypatch):
+    """A home of its own for real worker processes, and their backup root."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
+    with patch("pathlib.Path.home", return_value=home):
+        root = get_backup_root()
+    root.mkdir(parents=True, exist_ok=True)
+    yield root
+    background.stop(root)
+
+
+def _wait_running(root: Path, timeout: float = 60.0) -> background.BackgroundStatus:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        st = background.status(root)
+        if st.running:
+            return st
+        time.sleep(0.2)
+    return background.status(root)
+
+
+def test_a_real_worker_runs_alone_and_stops_between_ticks(worker_root: Path):
+    background.start(worker_root)
+    st = _wait_running(worker_root)
+    assert st.running and st.pid
+
+    second = subprocess.run(
+        [sys.executable, "-m", "claude_swap", "auto", "_worker"],
+        capture_output=True, timeout=120,
+    )
+    assert second.returncode == 0
+    assert background.status(worker_root).pid == st.pid
+
+    stopped = background.stop(worker_root)
+    assert stopped.running is False
+    assert load_settings(worker_root).enabled is False
+
+
+LEGACY_WORKER = """
+import json, sys, time
+from pathlib import Path
+settings = Path(sys.argv[1]) / "settings.json"
+print("up", flush=True)
+for _ in range(600):
+    try:
+        if not json.loads(settings.read_text())["autoswitch"]["enabled"]:
+            break
+    except (OSError, ValueError, KeyError):
+        pass
+    time.sleep(0.2)
+"""
+
+
+def test_start_retires_a_worker_from_a_build_before_the_lock(tmp_path: Path):
+    # The old worker holds no lock and leaves on reading enabled=false, as
+    # the previous build's did; "claude_swap" in its command line marks it.
+    set_setting(tmp_path, "autoswitch.enabled", "true")
+    legacy = subprocess.Popen(
+        [sys.executable, "-c", LEGACY_WORKER, str(tmp_path), "claude_swap"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    assert legacy.stdout.readline().strip() == "up"
+    (tmp_path / background.PID_FILENAME).write_text(f"{legacy.pid}\n")
+    try:
+        with patch("subprocess.Popen", return_value=_exited_proc()) as popen:
+            background.start(tmp_path)
+
+        assert legacy.wait(timeout=30) is not None
+        popen.assert_called_once()
+        assert load_settings(tmp_path).enabled is True
+        assert not (tmp_path / background.PID_FILENAME).exists()
+    finally:
+        legacy.kill()
+        legacy.wait()
 
 
 def test_stop_with_nothing_running_disables(tmp_path: Path):

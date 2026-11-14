@@ -31,13 +31,18 @@ When no candidate has that much room, it stays on the active account until it is
 ## How it reads usage
 
 - **The active account**: every `activeIntervalSeconds` (default 60), and every 20 seconds once a window is within 5 points of its line, from the rate-limit headers of a one-token request with Claude Code's live token. The usage endpoint only answers a few requests per account before it refuses with 429, and Claude Code spends that allowance on the active account itself; the headers have no such limit. A request to Fable is the only one whose headers carry Fable's weekly window, so the probe asks Fable when `model` names it (`probeModel` overrides the choice).
-- **Every other account**: from the usage endpoint every `accountIntervalSeconds` (default 15 min), one account per check, the most overdue first, and right after a window of it resets. A 429 backs off that account only.
+- **Every other account**: from the usage endpoint every `accountIntervalSeconds` (default 15 min), one account per check, the most overdue first, and right after a window of it resets, through the same collector `cswap list` uses (it refreshes a lapsed stored token through the consume gate, and only reads, never refreshes, an account a live `cswap run` session owns). A 429 backs off that account only.
+- **Per-model windows other than Fable's** (`model` set to `Opus`, `all`, …) are not in the headers. For the active account they are read from the endpoint with Claude Code's token, never refreshed, every `accountIntervalSeconds`; between reads, and on a probed target, the last endpoint figure is kept until its reset, as a lower bound. A `model` name that no account reports is named once in the log.
 
 Each reading is stored in the usage cache that `cswap list` and the TUI read, and held there until the engine's next read, so those surfaces do not spend the endpoint allowance on the same account.
 
 ## One engine
 
-A live engine holds `autoswitch.lock` in the backup directory while it runs. A second live engine (another worker, a foreground `cswap auto`, the TUI) refuses to start; a dry run does not take the lock. `cswap auto status` reports the process that holds it, and `cswap auto stop` ends that process.
+A live engine holds `autoswitch.lock` in the backup directory while it runs. A second live engine in another process (another worker, a foreground `cswap auto`, the TUI) refuses to start after a few seconds; an engine restarted inside the same process (the TUI or menu bar applying a change) waits for the previous one to finish its tick. `cswap auto status` reports the process that holds the lock.
+
+`cswap auto stop` clears `autoswitch.enabled` and waits up to 30 seconds: the worker exits after its current tick, so a token refresh in flight always gets stored. It never kills anything. A foreground `cswap auto` or the TUI is stopped where it runs. A worker from a build before the lock is asked to stop the same way when `cswap auto start` or `stop` runs.
+
+A dry run (`--dry-run`, the TUI's watch mode) does not take the lock, and never refreshes a stored login or probes a target: it decides on the last readings and names a would-be switch once.
 
 ## Logins that end
 

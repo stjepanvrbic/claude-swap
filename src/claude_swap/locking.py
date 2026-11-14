@@ -89,10 +89,13 @@ class InstanceLock:
 
     The lock is the operating system's, so it ends with the process whatever
     way it ends; nothing has to clean up after a crash. The holder's pid is
-    written next to it for ``holder_pid``.
+    written next to it for ``holder_pid``. Checking whether it is held takes
+    it for an instant without writing a pid, so a holder starting at that
+    moment should wait a little (``try_acquire(timeout=...)``) rather than
+    give up at the first refusal.
 
         lock = InstanceLock(root / "autoswitch.lock")
-        if not lock.try_acquire():
+        if not lock.try_acquire(timeout=3):
             print("already running, pid", lock.holder_pid())
     """
 
@@ -101,10 +104,7 @@ class InstanceLock:
         self.pid_path = lock_path.with_suffix(".pid")
         self._fd: int | None = None
 
-    def try_acquire(self) -> bool:
-        """Take the lock without waiting; False when another process has it."""
-        if self._fd is not None:
-            return True
+    def _take(self) -> int | None:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -114,36 +114,56 @@ class InstanceLock:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             os.close(fd)
-            return False
-        self._fd = fd
-        self.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
-        return True
+            return None
+        return fd
+
+    @staticmethod
+    def _drop(fd: int) -> None:
+        if sys.platform == "win32":
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    def try_acquire(self, timeout: float = 0.0) -> bool:
+        """Take the lock, retrying for up to ``timeout`` seconds; False when
+        another holder still has it then."""
+        if self._fd is not None:
+            return True
+        deadline = time.monotonic() + timeout
+        while True:
+            fd = self._take()
+            if fd is not None:
+                self._fd = fd
+                self.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
 
     def release(self) -> None:
         if self._fd is None:
             return
+        # The pid goes first: once unlocked, the next holder writes its own.
         try:
             self.pid_path.unlink()
         except OSError:
             pass
-        if sys.platform == "win32":
-            try:
-                os.lseek(self._fd, 0, os.SEEK_SET)
-                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
-            except OSError:
-                pass
-        else:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-        os.close(self._fd)
+        self._drop(self._fd)
         self._fd = None
 
     def held_elsewhere(self) -> bool:
-        """Whether another process holds the lock right now."""
+        """Whether another holder has the lock right now."""
         if self._fd is not None:
             return False
-        if not self.try_acquire():
+        fd = self._take()
+        if fd is None:
             return True
-        self.release()
+        self._drop(fd)
         return False
 
     def holder_pid(self) -> int | None:

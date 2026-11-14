@@ -35,8 +35,10 @@ STDERR_FILENAME = "autoswitch_background.err"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 3
 STDERR_MAX_BYTES = 1024 * 1024
-# How long `start` waits to see the new worker take the lock.
+# How long `start` waits to see the new worker take the lock, and how long
+# a stop waits for a worker to finish its tick and exit.
 START_WAIT_S = 5.0
+STOP_WAIT_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -107,9 +109,73 @@ def _lock(backup_root: Path) -> InstanceLock:
     return InstanceLock(backup_root / LOCK_FILENAME)
 
 
-def _remove_legacy_pid(backup_root: Path) -> None:
+def _process_running(pid: int) -> bool:
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        try:
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and (
+                code.value == 259  # STILL_ACTIVE
+            )
+        finally:
+            kernel32.CloseHandle(handle)
     try:
-        (backup_root / PID_FILENAME).unlink()
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _runs_claude_swap(pid: int) -> bool:
+    """Whether ``pid`` is still a claude-swap process, not a reused pid.
+    Windows offers no command line without WMI, so there a live pid counts;
+    it is only ever waited on there, never signalled."""
+    if sys.platform == "win32":
+        return _process_running(pid)
+    if sys.platform.startswith("linux"):
+        try:
+            return b"claude_swap" in Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return False
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "claude_swap" in out
+
+
+def _retire_legacy_worker(backup_root: Path, timeout: float) -> None:
+    """End a worker started by a build before the lock: it holds no lock, so
+    nothing else would notice it. It exits on its own once it reads
+    ``autoswitch.enabled`` false; on POSIX it is asked with SIGTERM too,
+    which it also handles between ticks."""
+    path = backup_root / PID_FILENAME
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid = 0
+    if pid > 0 and pid != os.getpid() and _runs_claude_swap(pid):
+        set_setting(backup_root, "autoswitch.enabled", "false")
+        if sys.platform != "win32":
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and _runs_claude_swap(pid):
+            time.sleep(0.2)
+    try:
+        path.unlink()
     except OSError:
         pass
 
@@ -131,11 +197,11 @@ def status(backup_root: Path) -> BackgroundStatus:
 
 
 def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
+    _retire_legacy_worker(backup_root, STOP_WAIT_S)
     current = status(backup_root)
     set_setting(backup_root, "autoswitch.enabled", "true")
     if current.running:
         return status(backup_root)
-    _remove_legacy_pid(backup_root)
 
     err = stderr_path(backup_root)
     err.parent.mkdir(parents=True, exist_ok=True)
@@ -187,32 +253,30 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
 def stop(
     backup_root: Path,
     *,
-    timeout: float = 15.0,
+    timeout: float = STOP_WAIT_S,
     persist: bool = True,
 ) -> BackgroundStatus:
-    """Stop whatever holds the auto-switch lock: SIGTERM, which ends the
-    loop between ticks, then a kill if it is still there at ``timeout``."""
+    """Stop the background worker, never by killing it.
+
+    The worker reads ``autoswitch.enabled`` between ticks and while it
+    sleeps, so clearing it (or, with ``persist`` False, the caller having
+    unset it) ends the worker once its current tick is done: a token refresh
+    in flight always gets to store its successor. No signal is sent: the
+    lock holder may be a foreground ``cswap auto`` or the TUI, and on
+    Windows ``os.kill`` terminates outright. The returned status says
+    whether something still holds the lock at ``timeout``.
+    """
     if persist:
         set_setting(backup_root, "autoswitch.enabled", "false")
-    _remove_legacy_pid(backup_root)
+    _retire_legacy_worker(backup_root, timeout)
     current = status(backup_root)
-    if not current.running or current.pid is None:
+    if not current.running:
         return current
-    try:
-        os.kill(current.pid, signal.SIGTERM)
-    except OSError:
-        return status(backup_root)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not status(backup_root).running:
-            return status(backup_root)
-        time.sleep(0.1)
-    if sys.platform != "win32":
-        try:
-            os.kill(current.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        time.sleep(0.5)
+            break
+        time.sleep(0.2)
     return status(backup_root)
 
 
