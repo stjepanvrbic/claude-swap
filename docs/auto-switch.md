@@ -62,6 +62,16 @@ The active account is read from the rate-limit headers of a one-token request (t
 
 Only one background worker runs per backup directory: a second one, however it was started, exits at once.
 
+## Running as a service
+
+`cswap auto start` writes the service definition and starts it; `cswap auto restart` rewrites it, which is how an upgrade or a moved `cswap` reaches it.
+
+- **Linux:** a systemd user unit, `~/.config/systemd/user/cswap-auto.service`, restarted 10 seconds after the worker dies. It carries the profile variables (`CLAUDE_CONFIG_DIR`, `XDG_DATA_HOME`) and proxy settings of the shell that started it, so it manages the same accounts. With lingering off (`loginctl enable-linger`), systemd stops it when you log out. Change it with `systemctl --user edit cswap-auto`, since `cswap auto start` rewrites the file.
+- **Windows:** a Task Scheduler task, `cswap auto-switch`, that runs the worker in your logon session with no console window. It starts at logon and again every two minutes. A run while the worker is alive does nothing, so a dead worker is back within two minutes; the task's own restart-on-failure does not fire when the worker is killed. If the task does not start the worker (no one is logged on at the PC), `cswap auto start` also launches one detached, and the task takes over when that one ends.
+- **A worker the service did not start** (an older cswap, `--debug`) gives way to the service's on the next `cswap auto start`; until then the service's worker waits and takes over when that one ends. `cswap auto status` says when the running worker is not the service's.
+- **Profile:** on Windows the task carries the starting shell's profile and proxy variables as worker arguments, since a task has no environment of its own.
+- `cswap auto stop` disables the unit or task, so it stays stopped across logins until `cswap auto start`.
+
 ## When something fails
 
 It fails safe: if a usage check errors it keeps trusting the last-known numbers, for a bounded time, while retries back off, and an expired token on an idle machine makes it hold rather than fail over (Claude Code refreshes the token on your next message).

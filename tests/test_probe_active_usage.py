@@ -444,9 +444,77 @@ def test_only_one_worker_runs_per_backup_root(worker_root: Path):
             first.wait()
 
 
+def test_a_service_run_worker_says_so_until_it_ends(worker_root: Path):
+    set_setting(worker_root, "autoswitch.enabled", "true")
+    worker = subprocess.Popen(
+        [*_worker(), "--service", "systemd"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        lock = background.worker_lock(worker_root)
+        deadline = time.monotonic() + 60
+        while background.status(worker_root).supervisor is None and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert background.status(worker_root).supervisor == "systemd"
+
+        set_setting(worker_root, "autoswitch.enabled", "false")
+        assert worker.wait(timeout=60) == 0
+        assert not lock.held_elsewhere()
+        assert not background.supervisor_path(worker_root).exists()
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait()
+
+
+def _wait_for_supervisor(root: Path, expected: str | None, timeout: float = 60) -> None:
+    deadline = time.monotonic() + timeout
+    while background.status(root).supervisor != expected and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert background.status(root).supervisor == expected
+
+
+def test_the_service_worker_takes_over_when_a_detached_one_ends(worker_root: Path):
+    set_setting(worker_root, "autoswitch.enabled", "true")
+    detached = subprocess.Popen(_worker(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    supervised = None
+    try:
+        lock = background.worker_lock(worker_root)
+        deadline = time.monotonic() + 60
+        while not lock.held_elsewhere() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        detached_pid = _holder_pid(worker_root)
+
+        supervised = subprocess.Popen(
+            [*_worker(), "--service", "systemd"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        time.sleep(8)
+        assert supervised.poll() is None  # waiting, not gone
+        assert background.status(worker_root).supervisor is None
+
+        os.kill(detached_pid, signal.SIGTERM)
+        _wait_for_supervisor(worker_root, "systemd")
+
+        # Stopped by something other than the service manager, with
+        # auto-switch on: a failure, so the manager starts it again.
+        os.kill(_holder_pid(worker_root), signal.SIGTERM)
+        assert supervised.wait(timeout=60) != 0
+    finally:
+        for proc in (detached, supervised):
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+# The autouse guard does not reach a child process: without this the
+# child would register and run the machine's real scheduled task.
 _STARTER = (
     "import sys, pathlib\n"
-    "from claude_swap import background\n"
+    "from claude_swap import background, service\n"
+    "def no_manager(_root):\n"
+    "    raise service.Unavailable('')\n"
+    "service.manager = no_manager\n"
     "sys.stdin.readline()\n"
     "background.start(pathlib.Path(sys.argv[1]))\n"
 )

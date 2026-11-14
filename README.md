@@ -95,14 +95,15 @@ cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first (more strategies below)
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
-cswap auto start               # run it as a detached background worker
+cswap auto start               # run it in the background, kept running by systemd / Task Scheduler
 cswap auto status              # is the background worker running?
 cswap auto pause               # pause switching while re-logging an account
 cswap auto resume              # resume switching
 cswap auto stop                # stop the background worker
+cswap auto restart             # restart it, e.g. after an upgrade
 ```
 
-`cswap auto start` sets `autoswitch.enabled` and launches a detached worker; `cswap auto stop` clears it and stops the worker (`cswap config set autoswitch.enabled true|false` does the same). `cswap auto pause` keeps the worker alive but makes every automatic check a no-op until `cswap auto resume`: use it before logging into Claude and running `cswap add`. The worker re-reads settings.json every few seconds, so these take effect without a restart. Its log is `autoswitch_background.log` in the backup directory, rotated at 5 MB.
+`cswap auto start` sets `autoswitch.enabled` and hands the worker to the service manager: a systemd user unit (`cswap-auto.service`) on Linux, a Task Scheduler task (`cswap auto-switch`) on Windows. It then starts at login and comes back if it dies, within seconds on Linux and two minutes on Windows. Where there is none (macOS, no user systemd) the worker runs detached and `cswap auto start` says nothing restarts it. `cswap auto stop` clears the setting, stops the worker and disables the unit or task (`cswap config set autoswitch.enabled true|false` does the same). `cswap auto pause` keeps the worker alive but makes every automatic check a no-op until `cswap auto resume`: use it before logging into Claude and running `cswap add`. The worker re-reads settings.json every few seconds, so these take effect without a restart. Its log is `autoswitch_background.log` in the backup directory, rotated at 5 MB.
 
 <details>
 <summary>Strategies, per-account controls & behavior</summary>
@@ -271,7 +272,7 @@ The original flag spellings (`cswap --switch`, `cswap --list`, ...) keep working
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`), auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) and the background worker's files (`autoswitch_background.pid`, `autoswitch_background.log`, `autoswitch_background.err`) live in the backup directory root.
+Session-mode profiles (`cswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`), auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) and the background worker's files (`autoswitch_background.pid`, `autoswitch_background.log`, `autoswitch_background.err`, and `autoswitch_background.service` while a service manager runs it) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 

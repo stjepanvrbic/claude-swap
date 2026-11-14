@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -950,11 +951,14 @@ _AUTO_BACKGROUND_ACTIONS = (
 )
 
 
+_SUPERVISOR_NAMES = {"systemd": "systemd", "task-scheduler": "Task Scheduler"}
+
+
 def _auto_background_command(argv: list[str]) -> None:
     """Handle `cswap auto start|stop|restart|status|pause|resume`."""
     parser = argparse.ArgumentParser(
         prog="cswap auto",
-        description="Manage the detached background auto-switch worker.",
+        description="Manage the background auto-switch worker.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -991,13 +995,11 @@ Examples:
         state = "paused" if st.paused else ("running" if st.running else "stopped")
         enabled = "enabled" if st.enabled else "disabled"
         pid = f", pid {st.pid}" if st.pid and st.running else ""
-        print(f"auto-switch background: {enabled}, {state}{pid}")
+        kept = f", kept running by {_SUPERVISOR_NAMES.get(st.supervisor, st.supervisor)}" if st.supervisor else ""
+        print(f"auto-switch background: {enabled}, {state}{pid}{kept}")
         print(dimmed(f"log: {st.log_path}"))
-        if st.ends_with_caller:
-            warning(
-                "This session's job object keeps the worker, so it stops "
-                "when this session ends."
-            )
+        for msg in st.warnings:
+            warning(msg)
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -1017,6 +1019,18 @@ Examples:
             st = background.resume(root, debug=args.debug)
         else:
             st = background.status(root)
+            if st.running and st.supervisor is None:
+                from claude_swap import service
+
+                try:
+                    service.manager(root)
+                except service.Unavailable:
+                    pass
+                else:
+                    st = dataclasses.replace(st, warnings=(
+                        "The worker runs outside the service manager, so nothing "
+                        "restarts it if it dies: `cswap auto restart` hands it over.",
+                    ))
         render(st, action)
     except ClaudeSwitchError as e:
         if args.json:
@@ -1038,7 +1052,15 @@ def _auto_worker_command(argv: list[str]) -> None:
 
     parser = argparse.ArgumentParser(prog="cswap auto _worker", add_help=False)
     parser.add_argument("--debug", action="store_true")
+    # The service manager running this worker (see claude_swap.service).
+    parser.add_argument("--service")
+    # KEY=VALUE from the shell that set the service up: a scheduled task
+    # carries no environment of its own.
+    parser.add_argument("--env", action="append", default=[])
     args = parser.parse_args(argv)
+    for assignment in args.env:
+        key, _, value = assignment.partition("=")
+        os.environ[key] = value
 
     from claude_swap import background
     from claude_swap.autoswitch import AutoSwitchEngine, pct_label
@@ -1055,34 +1077,57 @@ def _auto_worker_command(argv: list[str]) -> None:
             sys.exit(0)
 
         # One worker per backup root, whoever started it (systemd, a login
-        # task, `cswap auto start`): a second one leaves at once.
+        # task, `cswap auto start`): a second one leaves at once, except
+        # the service's, which waits to take over when the other one ends.
         lock = background.worker_lock(root)
         if not lock.try_acquire(timeout=3.0):
+            if not args.service:
+                emit.write(
+                    f"another auto-switch worker holds the lock; worker "
+                    f"{os.getpid()} exiting"
+                )
+                sys.exit(0)
             emit.write(
-                f"another auto-switch worker holds the lock; worker "
-                f"{os.getpid()} exiting"
+                f"another auto-switch worker holds the lock; the {args.service} "
+                f"worker {os.getpid()} takes over when it ends"
             )
-            sys.exit(0)
+            while not lock.try_acquire(timeout=5.0):
+                if not reload_settings(root).enabled:
+                    emit.write("auto-switch background disabled; worker exiting")
+                    sys.exit(0)
+            settings = load_settings(root)
 
-        engine = AutoSwitchEngine(switcher, settings, emit)
-        signal.signal(signal.SIGTERM, lambda *_: engine.stop())
-        weekly = (
-            f", weekly {pct_label(settings.weekly_threshold)}%"
-            if settings.weekly_threshold is not None
-            else ""
-        )
-        emit.write(
-            f"Auto-switch background worker running: threshold "
-            f"{pct_label(settings.threshold)}%{weekly}, strategy "
-            f"{settings.strategy}, every {settings.interval_seconds:.0f}s"
-        )
         try:
+            if args.service:
+                background.mark_supervised(root, args.service)
+                # A service manager keeps no console: a crash traceback goes
+                # to the worker's stderr file, as it does for a detached one.
+                with background.open_stderr(root) as err:
+                    os.dup2(err.fileno(), 2)
+            engine = AutoSwitchEngine(switcher, settings, emit)
+            signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+            weekly = (
+                f", weekly {pct_label(settings.weekly_threshold)}%"
+                if settings.weekly_threshold is not None
+                else ""
+            )
+            emit.write(
+                f"Auto-switch background worker running: threshold "
+                f"{pct_label(settings.threshold)}%{weekly}, strategy "
+                f"{settings.strategy}, every {settings.interval_seconds:.0f}s"
+            )
             code = engine.run_loop(
                 settings_loader=lambda: reload_settings(root),
                 should_continue=lambda current: current.enabled,
             )
         finally:
+            background.clear_supervised(root)
             lock.release()
+        if args.service and code == 0 and reload_settings(root).enabled:
+            # Stopped while auto-switch is on (a signal not from the service
+            # manager): a failure to the manager, so it starts the worker again.
+            emit.write("worker stopped while auto-switch is on; the service starts it again")
+            code = 1
         sys.exit(code)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
@@ -1224,6 +1269,8 @@ Examples:
                 print(dimmed(
                     f"auto-switch background: {'running' if st.running else 'stopped'}"
                 ))
+                for msg in st.warnings:
+                    warning(msg)
         elif action == "unset":
             if unset_setting(root, args.key):
                 default = setting_spec(args.key).default

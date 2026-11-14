@@ -500,6 +500,27 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def block_real_service_manager(request, monkeypatch):
+    """Safety net: no test may install, start or stop the developer's real
+    systemd unit or scheduled task. ``service.manager`` finds none and every
+    service-manager command fails. Tests marked ``real_service_manager``
+    register a throwaway unit or task of their own instead.
+    """
+    if request.node.get_closest_marker("real_service_manager"):
+        return
+    from claude_swap import service
+
+    def no_manager(_backup_root):
+        raise service.Unavailable("")
+
+    def refuse(argv):
+        raise AssertionError(f"a test ran a service-manager command: {argv}")
+
+    monkeypatch.setattr(service, "manager", no_manager)
+    monkeypatch.setattr(service, "_run", refuse)
+
+
+@pytest.fixture(autouse=True)
 def block_real_keychain(request, monkeypatch):
     """Safety net: no test may touch the real macOS Keychain.
 
