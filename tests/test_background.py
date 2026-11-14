@@ -185,6 +185,38 @@ def test_a_real_worker_runs_alone_and_stops_between_ticks(worker_root: Path):
     assert load_settings(worker_root).enabled is False
 
 
+STUBBORN_WORKER = """
+import signal, sys, time
+if hasattr(signal, "SIGTERM"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+print("up", flush=True)
+time.sleep(120)
+"""
+
+
+def test_start_refuses_while_an_old_worker_will_not_exit(tmp_path: Path):
+    set_setting(tmp_path, "autoswitch.enabled", "true")
+    stubborn = subprocess.Popen(
+        [sys.executable, "-c", STUBBORN_WORKER, "claude_swap"],
+        stdout=subprocess.PIPE, text=True,
+    )
+    assert stubborn.stdout.readline().strip() == "up"
+    pid_file = tmp_path / background.PID_FILENAME
+    pid_file.write_text(f"{stubborn.pid}\n")
+    try:
+        with patch.object(background, "STOP_WAIT_S", 1.0), \
+             patch("subprocess.Popen") as popen, \
+             pytest.raises(background.LegacyWorkerRunning):
+            background.start(tmp_path)
+
+        popen.assert_not_called()
+        assert pid_file.exists()
+        assert stubborn.poll() is None
+    finally:
+        stubborn.kill()
+        stubborn.wait()
+
+
 LEGACY_WORKER = """
 import json, sys, time
 from pathlib import Path

@@ -532,9 +532,10 @@ class TestSessionOwnedAccounts:
     ):
         for n in (1, 2, 3, 4):
             fleet.set(n, fable=10)
+        # Token expiry is judged on the real clock, not the fleet's.
         expired = json.dumps({"claudeAiOauth": {
             "accessToken": "sk-2", "refreshToken": "rt-2",
-            "expiresAt": int((fleet.clock.now - 60) * 1000),
+            "expiresAt": int((time.time() - 60) * 1000),
         }})
         fleet.switcher._write_account_credentials("2", fleet.email(2), expired)
         monkeypatch.setattr(
@@ -607,6 +608,15 @@ class TestEndpointOnlyWindows:
         assert fleet.active() != 1
         assert fleet.switches()[-1].trigger == "threshold"
 
+    def test_a_refused_probe_is_not_undone_by_the_endpoint_read(self, temp_home, network):
+        fleet = Fleet(temp_home, network, model="Fable,Opus")
+        fleet.set(1, fable=60, opus=10, refused=True)
+        for n in (2, 3, 4):
+            fleet.set(n, fable=0, opus=0)
+
+        assert fleet.tick() is TickOutcome.SWITCHED
+        assert fleet.switches()[-1].trigger == "at-limit"
+
     def test_a_model_no_account_reports_is_named_once(self, temp_home, network):
         fleet = Fleet(temp_home, network, model="Fabel")
         for n in (1, 2, 3, 4):
@@ -620,6 +630,30 @@ class TestEndpointOnlyWindows:
 
 
 class TestDryRun:
+    def test_a_dry_run_never_refreshes_a_lapsed_stored_login(self, fleet, monkeypatch):
+        fleet.engine = fleet.make_engine(dry_run=True)
+        for n in (1, 2, 3, 4):
+            fleet.set(n, fable=10)
+        # Token expiry is judged on the real clock, not the fleet's.
+        lapsed = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2", "refreshToken": "rt-2",
+            "expiresAt": int((time.time() - 60) * 1000),
+        }})
+        fleet.switcher._write_account_credentials("2", fleet.email(2), lapsed)
+        consumed = []
+        monkeypatch.setattr(
+            fleet.switcher, "consume_backup_grant", lambda *a: consumed.append(a)
+        )
+        monkeypatch.setattr(
+            oauth, "try_refresh_oauth_credentials", lambda *a: consumed.append(a)
+        )
+
+        for _ in range(12):
+            fleet.tick()
+            fleet.clock.advance(15)
+
+        assert consumed == []
+
     def test_a_dry_run_spends_nothing_on_the_target(self, fleet, network, monkeypatch):
         fleet.engine = fleet.make_engine(dry_run=True)
         fleet.set(1, fable=97)
@@ -674,6 +708,31 @@ class TestOneEngine:
                 pass
             holder.kill()
             holder.wait()
+
+    def test_a_single_tick_takes_the_lock_too(self, fleet):
+        # `cswap auto --once` from cron must not switch beside a worker.
+        fleet.set(1, fable=100, refused=True)
+        for n in (2, 3, 4):
+            fleet.set(n, fable=0)
+        holder = subprocess.Popen(
+            [sys.executable, "-c", _HOLDER, str(fleet.switcher.backup_dir),
+             str(Path(oauth.__file__).resolve().parents[1])],
+            stdout=subprocess.PIPE, text=True,
+        )
+        holder_pid = int(holder.stdout.readline().strip())
+        try:
+            with pytest.raises(EngineBusy):
+                fleet.engine.run_once()
+            assert fleet.active() == 1
+        finally:
+            try:
+                os.kill(holder_pid, signal.SIGTERM)
+            except OSError:
+                pass
+            holder.kill()
+            holder.wait()
+
+        assert fleet.engine.run_once() is TickOutcome.SWITCHED
 
     def test_a_restarted_engine_in_the_same_process_takes_over(self, fleet):
         for n in (1, 2, 3, 4):

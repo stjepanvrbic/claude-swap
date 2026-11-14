@@ -906,7 +906,7 @@ Defaults live in settings.json in the backup root; flags override them.
         )
 
         if args.once:
-            sys.exit(engine.tick().value)
+            sys.exit(engine.run_once().value)
 
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())

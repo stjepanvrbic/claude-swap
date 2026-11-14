@@ -270,6 +270,9 @@ class TestConfigMisc:
 
                 return TickOutcome.NO_ACTION
 
+            def run_once(self):
+                return self.tick()
+
         with patch("claude_swap.autoswitch.AutoSwitchEngine", FakeEngine), \
              patch("os.geteuid", return_value=1000, create=True), \
              patch.object(sys, "argv", ["claude-swap", "auto", "--once"]):
@@ -323,6 +326,9 @@ class TestWeeklyThresholdConfig:
                 from claude_swap.autoswitch import TickOutcome
 
                 return TickOutcome.NO_ACTION
+
+            def run_once(self):
+                return self.tick()
 
         with patch("claude_swap.autoswitch.AutoSwitchEngine", FakeEngine), \
              patch("os.geteuid", return_value=1000, create=True), \

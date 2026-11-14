@@ -738,7 +738,9 @@ class AutoSwitchEngine:
             return False
         self._last_active_attempt = now
         reading = self.reader.read_active(view.number)
-        if reading.ok and self._needs_endpoint() and (
+        # A refused probe settles it: the endpoint's figures would replace
+        # the reading and drop the refusal.
+        if reading.ok and "rejected" not in reading.usage and self._needs_endpoint() and (
             self._last_active_endpoint is None
             or now - self._last_active_endpoint >= self.settings.account_interval_seconds
         ) and not (view.backoff_until is not None and now < view.backoff_until):
@@ -752,7 +754,8 @@ class AutoSwitchEngine:
         if self._token_expired_since is None:
             self._token_expired_since = now
         if (
-            now - self._token_expired_since >= DEAD_LOGIN_CHECK_S
+            not self.dry_run
+            and now - self._token_expired_since >= DEAD_LOGIN_CHECK_S
             and now - self._last_login_check >= DEAD_LOGIN_CHECK_S
         ):
             self._last_login_check = now
@@ -840,10 +843,24 @@ class AutoSwitchEngine:
             return False
         _, number = min(due)
         self._last_account_attempt[number] = now
-        self.reader.read_account(number)
+        if self.dry_run:
+            # Never refresh a stored login from a dry run.
+            self.reader.read_account_readonly(number)
+        else:
+            self.reader.read_account(number)
         return True
 
     # -- tick -----------------------------------------------------------------
+
+    def run_once(self) -> TickOutcome:
+        """One tick under the data directory's engine lock, as cron runs it;
+        raises :class:`EngineBusy` while another live engine runs."""
+        lock = None if self.dry_run else self._take_lock()
+        try:
+            return self.tick()
+        finally:
+            if lock is not None:
+                lock.release()
 
     def tick(self) -> TickOutcome:
         """Evaluate once: read what is due, maybe switch. Never raises."""

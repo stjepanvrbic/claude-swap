@@ -126,6 +126,30 @@ class UsageReader:
             return Reading(entry.last_good)
         return Reading(None, error=entry.last_error or "bad-response")
 
+    def read_account_readonly(self, number: str) -> Reading | None:
+        """Read an inactive account from the usage endpoint with its stored
+        token as it is, never refreshing it; None when that token has
+        lapsed. For a dry run, which must not touch a stored login."""
+        email = self.switcher.account_email(number)
+        creds = self.switcher.read_account_credentials(number, email) if email else ""
+        data = oauth.extract_oauth_data(creds) if creds else None
+        if not data or not data.get("accessToken"):
+            return None
+        if oauth.is_oauth_token_expired(data.get("expiresAt")):
+            return None
+        outcome = oauth.try_fetch_usage_for_account(number, email, creds, is_active=True)
+        error = outcome.error
+        if error is None and outcome.usage is None:
+            error = "bad-response"
+        return self._record(
+            number,
+            Reading(
+                outcome.usage if error is None else None,
+                error=error,
+                retry_after_s=outcome.retry_after_s,
+            ),
+        )
+
     def read_active_endpoint(self, number: str) -> Reading:
         """Read the active account from the usage endpoint with Claude Code's
         live token, never refreshing it. Only needed for per-model windows

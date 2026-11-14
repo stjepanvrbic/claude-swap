@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.locking import InstanceLock
 from claude_swap.settings import load_settings, set_setting
 
@@ -154,11 +155,24 @@ def _runs_claude_swap(pid: int) -> bool:
     return "claude_swap" in out
 
 
+class LegacyWorkerRunning(ClaudeSwitchError):
+    """A worker from a build before the lock did not exit when asked."""
+
+    def __init__(self, pid: int, pid_file: Path):
+        super().__init__(
+            f"a worker from an earlier cswap version (pid {pid}) is still "
+            f"running and did not exit; end it, then retry. If pid {pid} is "
+            f"not cswap, delete {pid_file}"
+        )
+
+
 def _retire_legacy_worker(backup_root: Path, timeout: float) -> None:
     """End a worker started by a build before the lock: it holds no lock, so
     nothing else would notice it. It exits on its own once it reads
     ``autoswitch.enabled`` false; on POSIX it is asked with SIGTERM too,
-    which it also handles between ticks."""
+    which it also handles between ticks. Raises
+    :class:`LegacyWorkerRunning`, keeping its pid file, when it is still
+    there at ``timeout``: a second engine must not start beside it."""
     path = backup_root / PID_FILENAME
     try:
         pid = int(path.read_text(encoding="utf-8").strip())
@@ -172,7 +186,9 @@ def _retire_legacy_worker(backup_root: Path, timeout: float) -> None:
             except OSError:
                 pass
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and _runs_claude_swap(pid):
+        while _runs_claude_swap(pid):
+            if time.monotonic() >= deadline:
+                raise LegacyWorkerRunning(pid, path)
             time.sleep(0.2)
     try:
         path.unlink()

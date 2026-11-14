@@ -1624,6 +1624,9 @@ class TestAutoCommand:
 
             return type(self).tick_outcome or TickOutcome.NO_ACTION
 
+        def run_once(self):
+            return self.tick()
+
         def run_loop(self):
             return 0
 

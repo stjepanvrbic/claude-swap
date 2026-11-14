@@ -38,11 +38,11 @@ Each reading is stored in the usage cache that `cswap list` and the TUI read, an
 
 ## One engine
 
-A live engine holds `autoswitch.lock` in the backup directory while it runs. A second live engine in another process (another worker, a foreground `cswap auto`, the TUI) refuses to start after a few seconds; an engine restarted inside the same process (the TUI or menu bar applying a change) waits for the previous one to finish its tick. `cswap auto status` reports the process that holds the lock.
+A live engine holds `autoswitch.lock` in the backup directory while it runs, and `cswap auto --once` holds it for its one check. A second live engine in another process (another worker, a foreground `cswap auto`, a cron `--once`, the TUI) refuses to start after a few seconds; an engine restarted inside the same process (the TUI or menu bar applying a change) waits for the previous one to finish its tick. `cswap auto status` reports the process that holds the lock.
 
-`cswap auto stop` clears `autoswitch.enabled` and waits up to 30 seconds: the worker exits after its current tick, so a token refresh in flight always gets stored. It never kills anything. A foreground `cswap auto` or the TUI is stopped where it runs. A worker from a build before the lock is asked to stop the same way when `cswap auto start` or `stop` runs.
+`cswap auto stop` clears `autoswitch.enabled` and waits up to 30 seconds: the worker exits after its current tick, so a token refresh in flight always gets stored. It never kills anything. A foreground `cswap auto` or the TUI is stopped where it runs. A worker from a build before the lock is asked to stop the same way when `cswap auto start` or `stop` runs; if it has not exited after 30 seconds, `start` refuses to launch another beside it and names its pid.
 
-A dry run (`--dry-run`, the TUI's watch mode) does not take the lock, and never refreshes a stored login or probes a target: it decides on the last readings and names a would-be switch once.
+A dry run (`--dry-run`, the TUI's watch mode) does not take the lock, and never refreshes a stored login or probes a target: it reads other accounts only while their stored token is still valid, decides on the last readings and names a would-be switch once.
 
 ## Logins that end
 
