@@ -444,6 +444,29 @@ def test_only_one_worker_runs_per_backup_root(worker_root: Path):
             first.wait()
 
 
+def test_a_service_run_worker_says_so_until_it_ends(worker_root: Path):
+    set_setting(worker_root, "autoswitch.enabled", "true")
+    worker = subprocess.Popen(
+        [*_worker(), "--service", "systemd"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        lock = background.worker_lock(worker_root)
+        deadline = time.monotonic() + 60
+        while background.status(worker_root).supervisor is None and time.monotonic() < deadline:
+            time.sleep(0.2)
+        assert background.status(worker_root).supervisor == "systemd"
+
+        set_setting(worker_root, "autoswitch.enabled", "false")
+        assert worker.wait(timeout=60) == 0
+        assert not lock.held_elsewhere()
+        assert not background.supervisor_path(worker_root).exists()
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait()
+
+
 _STARTER = (
     "import sys, pathlib\n"
     "from claude_swap import background\n"

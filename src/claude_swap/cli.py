@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -950,11 +951,14 @@ _AUTO_BACKGROUND_ACTIONS = (
 )
 
 
+_SUPERVISOR_NAMES = {"systemd": "systemd", "task-scheduler": "Task Scheduler"}
+
+
 def _auto_background_command(argv: list[str]) -> None:
     """Handle `cswap auto start|stop|restart|status|pause|resume`."""
     parser = argparse.ArgumentParser(
         prog="cswap auto",
-        description="Manage the detached background auto-switch worker.",
+        description="Manage the background auto-switch worker.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -991,13 +995,11 @@ Examples:
         state = "paused" if st.paused else ("running" if st.running else "stopped")
         enabled = "enabled" if st.enabled else "disabled"
         pid = f", pid {st.pid}" if st.pid and st.running else ""
-        print(f"auto-switch background: {enabled}, {state}{pid}")
+        kept = f", kept running by {_SUPERVISOR_NAMES.get(st.supervisor, st.supervisor)}" if st.supervisor else ""
+        print(f"auto-switch background: {enabled}, {state}{pid}{kept}")
         print(dimmed(f"log: {st.log_path}"))
-        if st.ends_with_caller:
-            warning(
-                "This session's job object keeps the worker, so it stops "
-                "when this session ends."
-            )
+        for msg in st.warnings:
+            warning(msg)
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -1017,6 +1019,18 @@ Examples:
             st = background.resume(root, debug=args.debug)
         else:
             st = background.status(root)
+            if st.running and st.supervisor is None:
+                from claude_swap import service
+
+                try:
+                    service.manager(root)
+                except service.Unavailable:
+                    pass
+                else:
+                    st = dataclasses.replace(st, warnings=(
+                        "The worker runs outside the service manager, so nothing "
+                        "restarts it if it dies: `cswap auto restart` hands it over.",
+                    ))
         render(st, action)
     except ClaudeSwitchError as e:
         if args.json:
@@ -1038,6 +1052,8 @@ def _auto_worker_command(argv: list[str]) -> None:
 
     parser = argparse.ArgumentParser(prog="cswap auto _worker", add_help=False)
     parser.add_argument("--debug", action="store_true")
+    # The service manager running this worker (see claude_swap.service).
+    parser.add_argument("--service")
     args = parser.parse_args(argv)
 
     from claude_swap import background
@@ -1064,6 +1080,11 @@ def _auto_worker_command(argv: list[str]) -> None:
             )
             sys.exit(0)
 
+        if args.service:
+            # A service manager keeps no console: a crash traceback goes to
+            # the worker's stderr file, as it does for a detached worker.
+            with background.open_stderr(root) as err:
+                os.dup2(err.fileno(), 2)
         engine = AutoSwitchEngine(switcher, settings, emit)
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         weekly = (
@@ -1077,11 +1098,14 @@ def _auto_worker_command(argv: list[str]) -> None:
             f"{settings.strategy}, every {settings.interval_seconds:.0f}s"
         )
         try:
+            if args.service:
+                background.mark_supervised(root, args.service)
             code = engine.run_loop(
                 settings_loader=lambda: reload_settings(root),
                 should_continue=lambda current: current.enabled,
             )
         finally:
+            background.clear_supervised(root)
             lock.release()
         sys.exit(code)
     except ClaudeSwitchError as e:
@@ -1224,6 +1248,8 @@ Examples:
                 print(dimmed(
                     f"auto-switch background: {'running' if st.running else 'stopped'}"
                 ))
+                for msg in st.warnings:
+                    warning(msg)
         elif action == "unset":
             if unset_setting(root, args.key):
                 default = setting_spec(args.key).default

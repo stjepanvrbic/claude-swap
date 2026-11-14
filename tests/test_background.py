@@ -52,7 +52,7 @@ def test_start_on_windows_uses_hidden_console(tmp_path: Path):
         lock.return_value.held_elsewhere.return_value = False
         st = background.start(tmp_path)
 
-    assert not st.ends_with_caller
+    assert st.warnings == ()
     flags = popen.call_args.kwargs["creationflags"]
     assert flags & 0x08000000
     assert not flags & 0x00000008
@@ -75,8 +75,8 @@ def test_start_on_windows_stays_in_a_job_that_forbids_breakaway(tmp_path: Path):
     first, second = (c.kwargs["creationflags"] for c in popen.call_args_list)
     assert first & 0x01000000
     assert second == 0x08000000 | 0x00000200
-    assert st.ends_with_caller
-    assert st.to_json()["endsWithCaller"] is True
+    assert any("stops when this session ends" in w for w in st.warnings)
+    assert st.to_json()["warnings"] == list(st.warnings)
 
 
 def test_stop_disables_and_removes_dead_pid(tmp_path: Path):
