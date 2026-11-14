@@ -1200,13 +1200,19 @@ def try_fetch_usage_for_account(
             return _usage_from_probe(access_token, context)
         return UsageOutcome(None, error="setup-token")
 
+    probe_failure: UsageOutcome | None = None
     if is_active and probe_model is not None:
         probed = _usage_from_probe(access_token, context, probe_model)
         if probed.error is None and _probe_reading_covers(probed.usage, probe_model):
             return probed
         # A probe the server did not answer (overloaded, network) or whose
         # headers lack a window is no reason to treat the account as
-        # unreadable: the endpoint still may answer.
+        # unreadable: the endpoint still may answer. If it does not, the
+        # probe's own failure is what is recorded (below).
+        probe_failure = (
+            probed if probed.error is not None
+            else UsageOutcome(None, error="bad-response")
+        )
 
     working_credentials = credentials
 
@@ -1256,12 +1262,19 @@ def try_fetch_usage_for_account(
         return UsageOutcome(build_usage_result(data))
     except urllib.error.HTTPError as e:
         kind, retry_after = _classify_usage_error(e)
-        if e.code == 429 and probe_model is not None:
+        if probe_failure is not None and e.code != 401:
+            # The active account's probe already failed. The endpoint's
+            # refusal (often an hour-long 429) must not be recorded as this
+            # account's state: its backoff would also hold off the probe,
+            # which is what reads the active account.
+            _logger.debug("Usage endpoint fallback failed %s: %s", context, kind)
+            return probe_failure
+        if e.code == 429 and probe_model is not None and probe_failure is None:
             probed = _usage_from_probe(access_token, context, probe_model)
             if probed.error is None:
-                _logger.debug(
-                    "Usage endpoint answered 429 %s; read from the header probe",
-                    context,
+                _logger.info(
+                    "Usage endpoint answered 429 %s (retry-after %s); read "
+                    "from the header probe", context, retry_after,
                 )
                 return probed
         if (
@@ -1316,6 +1329,8 @@ def try_fetch_usage_for_account(
             _log_usage_failure(context + " after refresh", retry_error, kind, retry_after)
             return UsageOutcome(None, error=kind, retry_after_s=retry_after)
     except Exception as e:
+        if probe_failure is not None:
+            return probe_failure
         kind, retry_after = _classify_usage_error(e)
         _log_usage_failure(context, e, kind, retry_after)
         return UsageOutcome(None, error=kind, retry_after_s=retry_after)

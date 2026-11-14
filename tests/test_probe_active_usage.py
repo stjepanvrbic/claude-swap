@@ -170,6 +170,26 @@ class TestTryFetch:
         assert network.endpoint_calls == ["sk-1"]
         assert outcome.usage["scoped"][0]["pct"] == 20.0
 
+    def test_a_failed_probe_and_a_refused_endpoint_record_the_probe_failure(
+        self, network
+    ):
+        # The endpoint's hour-long 429 would park the account, probe and
+        # all; the probe's failure is the short, honest record.
+        network.accounts["sk-1"] = Account(fable=20)
+        network.probe_error = urllib.error.HTTPError(
+            "https://api.anthropic.com/v1/messages", 529, "Overloaded", {}, None
+        )
+        network.endpoint_refuses = True
+
+        outcome = oauth.try_fetch_usage_for_account(
+            "1", "a@example.com", _creds("sk-1"), is_active=True,
+            probe_model=oauth.FABLE_PROBE_MODEL,
+        )
+
+        assert outcome.error == "http-529"
+        assert outcome.retry_after_s is None
+        assert len(network.probe_calls) == 1
+
     def test_another_account_is_read_from_the_endpoint(self, network):
         network.accounts["sk-2"] = Account(fable=10)
 
@@ -361,6 +381,17 @@ def worker_root(tmp_path: Path, monkeypatch):
         time.sleep(0.2)
 
 
+def _holder_pid(root: Path) -> int:
+    """The pid the worker writes just after it takes the lock."""
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            return int(background.pid_path(root).read_text().strip())
+        except (OSError, ValueError):
+            time.sleep(0.05)
+    raise AssertionError("the worker never wrote its pid")
+
+
 def _worker() -> list[str]:
     return [sys.executable, "-m", "claude_swap", "auto", "_worker"]
 
@@ -371,7 +402,7 @@ def test_start_reports_the_worker_that_holds_the_lock(worker_root: Path):
     deadline = time.monotonic() + 60
     while not lock.held_elsewhere() and time.monotonic() < deadline:
         time.sleep(0.2)
-    holder = int(background.pid_path(worker_root).read_text().strip())
+    holder = _holder_pid(worker_root)
 
     with patch("subprocess.Popen") as popen:
         again = background.start(worker_root)
@@ -389,7 +420,7 @@ def test_only_one_worker_runs_per_backup_root(worker_root: Path):
         deadline = time.monotonic() + 60
         while not lock.held_elsewhere() and time.monotonic() < deadline:
             time.sleep(0.2)
-        holder = int(background.pid_path(worker_root).read_text().strip())
+        holder = _holder_pid(worker_root)
         assert background.status(worker_root).running
 
         second = subprocess.run(_worker(), capture_output=True, timeout=120)

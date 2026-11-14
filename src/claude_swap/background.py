@@ -35,8 +35,9 @@ STDERR_FILENAME = "autoswitch_background.err"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 3
 STDERR_MAX_BYTES = 1024 * 1024
-# How long `start` waits to see the new worker take the lock.
-START_WAIT_S = 5.0
+# How long `start` waits to see the new worker take the lock (a loaded host
+# or a Windows venv launcher can take seconds).
+START_WAIT_S = 15.0
 
 
 @dataclass(frozen=True)
