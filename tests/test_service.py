@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -278,6 +279,29 @@ class TestStartUnderAManager:
 
         no_detached_launch.assert_called_once()
         assert "did not start" in st.warnings[0]
+
+    def test_a_lock_that_outlives_stop_still_lets_restart_start_the_service(self, tmp_path: Path):
+        lock = background.worker_lock(tmp_path)
+        assert lock.try_acquire(timeout=1.0)
+        background.pid_path(tmp_path).write_text("12345\n")
+        background.supervisor_path(tmp_path).write_text("12345 systemd\n")
+        manager = FakeManager()
+        try:
+            with patch.object(service, "manager", return_value=manager), \
+                 patch.object(background, "_process_running", return_value=False), \
+                 patch.object(background.os, "kill"):
+                stopped = background.stop(tmp_path, timeout=0.5)
+                # The dead worker's pid goes with it, whatever its lock says.
+                assert not background.pid_path(tmp_path).exists()
+                assert "still holds the auto-switch lock" in stopped.warnings[0]
+
+                threading.Timer(0.5, lock.release).start()
+                with patch.object(background, "wait_for_worker", return_value=True):
+                    background.start(tmp_path)
+        finally:
+            lock.release()
+
+        assert manager.calls == ["deactivate", "install", "activate"]
 
     def test_stop_keeps_the_manager_from_starting_it_again(self, tmp_path: Path):
         manager = FakeManager()

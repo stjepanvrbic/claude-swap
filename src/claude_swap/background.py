@@ -181,6 +181,12 @@ def _remove_pid(path: Path) -> None:
         pass
 
 
+def _remove_pid_naming(path: Path, pid: int | None) -> None:
+    """Remove the pid file while it still names ``pid``."""
+    if pid is not None and _read_pid(path) == pid:
+        _remove_pid(path)
+
+
 def _process_running(pid: int | None) -> bool:
     if pid is None:
         return False
@@ -374,11 +380,13 @@ def _launch_detached(
 def stop(
     backup_root: Path,
     *,
-    timeout: float = 5.0,
+    timeout: float = 30.0,
     persist: bool = True,
 ) -> BackgroundStatus:
     """Stop the worker and keep the service manager from starting it again;
-    ``persist`` also turns auto-switch off."""
+    ``persist`` also turns auto-switch off. Waits up to ``timeout`` seconds
+    for the worker's lock to free: on Linux and macOS a worker in the middle
+    of a check finishes it first."""
     if persist:
         set_setting(backup_root, "autoswitch.enabled", "false")
     try:
@@ -392,24 +400,36 @@ def stop(
     except service.ServiceError as e:
         warnings.append(f"The {manager.describe()} could not be disabled ({e}).")
     current = status(backup_root)
+    lock = worker_lock(backup_root)
     # Only the lock's holder owns the pid file's pid: a killed worker's pid
     # can belong to another process by now.
-    if current.pid is None or not worker_lock(backup_root).held_elsewhere():
-        _remove_pid(current.pid_path)
-        return replace(status(backup_root), warnings=tuple(warnings))
+    holder = current.pid if lock.held_elsewhere() else None
+    if holder is not None:
+        try:
+            os.kill(holder, signal.SIGTERM)
+        except OSError:
+            pass  # already gone
 
-    try:
-        os.kill(current.pid, signal.SIGTERM)
-    except OSError:
-        _remove_pid(current.pid_path)
-        return replace(status(backup_root), warnings=tuple(warnings))
-
+    # Stopped means the lock is free, not just the process gone: Windows
+    # reports a terminated process exited a moment before it closes the
+    # process's handles, the lock file's among them, and a worker shutting
+    # down removes its pid file before it lets go of the lock. The pid file
+    # goes as soon as its process does, since its pid can be reused, but
+    # only while it names that process and not a worker started since.
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not _process_running(current.pid):
-            _remove_pid(current.pid_path)
+    while lock.held_elsewhere():
+        if holder is not None and not _process_running(holder):
+            _remove_pid_naming(current.pid_path, holder)
+        if time.monotonic() >= deadline:
+            if holder is not None and _process_running(holder):
+                said = f"The worker (pid {holder}) was asked to stop but still holds its lock"
+            else:
+                said = "A worker still holds the auto-switch lock"
+            warnings.append(f"{said} after {timeout:.0f}s.")
             break
         time.sleep(0.1)
+    else:
+        _remove_pid_naming(current.pid_path, current.pid)
     return replace(status(backup_root), warnings=tuple(warnings))
 
 

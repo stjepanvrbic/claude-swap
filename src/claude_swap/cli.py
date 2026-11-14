@@ -1011,8 +1011,9 @@ Examples:
         elif action == "stop":
             st = background.stop(root)
         elif action == "restart":
-            background.stop(root)
+            stopped = background.stop(root)
             st = background.start(root, debug=args.debug)
+            st = dataclasses.replace(st, warnings=stopped.warnings + st.warnings)
         elif action == "pause":
             st = background.pause(root)
         elif action == "resume":
@@ -1282,6 +1283,8 @@ Examples:
                     print(dimmed(
                         f"auto-switch background: {'running' if st.running else 'stopped'}"
                     ))
+                    for msg in st.warnings:
+                        warning(msg)
             else:
                 print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
     except ClaudeSwitchError as e:
