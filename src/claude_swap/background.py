@@ -374,11 +374,12 @@ def _launch_detached(
 def stop(
     backup_root: Path,
     *,
-    timeout: float = 5.0,
+    timeout: float = 30.0,
     persist: bool = True,
 ) -> BackgroundStatus:
     """Stop the worker and keep the service manager from starting it again;
-    ``persist`` also turns auto-switch off."""
+    ``persist`` also turns auto-switch off. A worker in the middle of a check
+    finishes it first, so this waits up to ``timeout`` seconds."""
     if persist:
         set_setting(backup_root, "autoswitch.enabled", "false")
     try:
@@ -404,13 +405,22 @@ def stop(
         _remove_pid(current.pid_path)
         return replace(status(backup_root), warnings=tuple(warnings))
 
-    # The lock, not the process: Windows reports a terminated process gone
-    # before it closes the process's handles, the lock file's among them.
+    # Stopped means the lock is free, not just the process gone: Windows
+    # reports a terminated process exited a moment before it closes the
+    # process's handles, the lock file's among them. The pid file goes as
+    # soon as the process does, since its pid can be reused.
     lock = worker_lock(backup_root)
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not lock.held_elsewhere():
+    while True:
+        if not _process_running(current.pid):
             _remove_pid(current.pid_path)
+            if not lock.held_elsewhere():
+                break
+        if time.monotonic() >= deadline:
+            warnings.append(
+                f"The worker (pid {current.pid}) was asked to stop but still "
+                f"holds its lock after {timeout:.0f}s."
+            )
             break
         time.sleep(0.1)
     return replace(status(backup_root), warnings=tuple(warnings))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -144,17 +145,20 @@ def test_worker_output_goes_to_stderr_file_not_the_event_log(tmp_path: Path):
     assert kwargs["stdout"] is background.subprocess.DEVNULL
 
 
+
 def test_stop_reports_stopped_only_once_the_lock_is_free(tmp_path: Path):
-    # Windows: the process reads as exited while its lock is still held.
+    # Windows reports a killed worker exited a moment before its lock frees.
+    lock = background.worker_lock(tmp_path)
+    assert lock.try_acquire(timeout=1.0)
     (tmp_path / background.PID_FILENAME).write_text("12345\n")
-    lock = Mock()
-    lock.held_elsewhere.side_effect = [True, True, True, False, False]
+    try:
+        with patch("claude_swap.background._process_running", return_value=False), \
+             patch("claude_swap.background.os.kill",
+                   side_effect=lambda *_: threading.Timer(0.3, lock.release).start()):
+            st = background.stop(tmp_path)
+    finally:
+        lock.release()
 
-    with patch("claude_swap.background.worker_lock", return_value=lock), \
-         patch("claude_swap.background._process_running", return_value=False), \
-         patch("claude_swap.background.os.kill") as kill:
-        st = background.stop(tmp_path)
-
-    kill.assert_called_once()
     assert st.running is False
+    assert st.warnings == ()
     assert not (tmp_path / background.PID_FILENAME).exists()
