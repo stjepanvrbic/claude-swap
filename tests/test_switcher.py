@@ -8,12 +8,13 @@ import os
 import sys
 import time
 import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from claude_swap import macos_keychain
+from claude_swap import background, macos_keychain
 from claude_swap import oauth
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import (
@@ -1404,7 +1405,23 @@ class TestSetupTokenHeaderProbeWiring:
             "rejected": {"retry_after_s": None, "resets_at": None},
             "source": oauth.USAGE_SOURCE_HEADERS,
         }
-        assert _format_usage_lines(rejected)[-1] == "probe: rejected"
+        assert _format_usage_lines(rejected)[-1] == "limit: reached"
+
+    def test_a_refusal_a_window_at_its_limit_explains_adds_no_row(self):
+        reset = datetime.fromtimestamp(time.time() + 86400, tz=timezone.utc).isoformat()
+        fable_out = {
+            "seven_day": {"pct": 64.0},
+            "scoped": [{"name": "Fable", "pct": 100.0, "resets_at": reset}],
+            "rejected": {"retry_after_s": None, "resets_at": reset},
+            "source": oauth.USAGE_SOURCE_HEADERS,
+        }
+        lines = _format_usage_lines(fable_out)
+        assert lines[-1].startswith("Fable: 100%   resets")
+        assert not any(line.startswith("limit:") for line in lines)
+
+        # Without the window's reset, the refusal is where the time is.
+        del fable_out["scoped"][0]["resets_at"]
+        assert _format_usage_lines(fable_out)[-1].startswith("limit: reached   until")
 
 
 class TestAdoptSessionCredential:
@@ -1619,6 +1636,36 @@ class TestListAccountsUsage:
         assert "└ 7d:" in output
         assert "10%" in output
         assert "50%" in output
+
+    def test_list_warns_while_the_enabled_worker_is_down(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-active"}})
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        def listed() -> str:
+            with patch.object(switcher, "_read_credentials", return_value=creds), \
+                 patch.object(switcher, "_read_account_credentials", return_value=creds), \
+                 patch("claude_swap.oauth.try_fetch_usage_for_account",
+                       return_value=oauth.UsageOutcome(None)):
+                switcher.list_accounts()
+            return capsys.readouterr().out
+
+        down = "background worker is not running"
+        assert down not in listed()
+        set_setting(switcher.backup_dir, "autoswitch.enabled", "true")
+        assert down in listed()
+        # A killed worker's pid file outlives it, and the pid gets reused.
+        background.pid_path(switcher.backup_dir).write_text(f"{os.getpid()}\n")
+        assert down in listed()
+        lock = background.worker_lock(switcher.backup_dir)
+        assert lock.try_acquire(timeout=1.0)
+        try:
+            assert down not in listed()
+        finally:
+            lock.release()
 
     def test_list_shows_alias_before_email(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys

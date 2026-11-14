@@ -629,8 +629,8 @@ class TestUsageRows:
             "source": "headers",
         }
         label, pct, suffix, _full = usage_rows(last_good, now, now)[-1]
-        assert (label, pct) == ("probe", 100.0)
-        assert suffix.startswith("rejected (!)") and "resets" in suffix
+        assert (label, pct) == ("limit", 100.0)
+        assert suffix.startswith("reached (!)") and "resets" in suffix
 
     def test_no_pace_marker_without_fetched_at(self):
         from claude_swap.tui.widgets import usage_rows
@@ -686,7 +686,7 @@ class TestMiniAccountText:
             age_s=0.0,
         )
         text = mini_account_text(make_account(1, entry=entry), now).plain
-        assert text.endswith("5h 20% · 7d 30% · rejected (!)")
+        assert text.endswith("5h 20% · 7d 30% · limit (!)")
 
     def test_seven_day_ahead_of_pace_marker(self):
         from claude_swap.tui.widgets import mini_account_text

@@ -47,13 +47,36 @@ def test_start_on_windows_uses_hidden_console(tmp_path: Path):
          patch("subprocess.CREATE_NO_WINDOW", 0x08000000, create=True), \
          patch("subprocess.DETACHED_PROCESS", 0x00000008, create=True), \
          patch("subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True), \
+         patch("subprocess.CREATE_BREAKAWAY_FROM_JOB", 0x01000000, create=True), \
          patch("subprocess.Popen", return_value=proc) as popen:
         lock.return_value.held_elsewhere.return_value = False
-        background.start(tmp_path)
+        st = background.start(tmp_path)
 
+    assert not st.ends_with_caller
     flags = popen.call_args.kwargs["creationflags"]
     assert flags & 0x08000000
     assert not flags & 0x00000008
+    assert flags & 0x01000000  # out of the caller's job object
+
+
+def test_start_on_windows_stays_in_a_job_that_forbids_breakaway(tmp_path: Path):
+    proc = Mock(pid=12345)
+
+    with patch("claude_swap.background.worker_lock") as lock, \
+         patch("claude_swap.background.sys.platform", "win32"), \
+         patch("claude_swap.background._process_running", return_value=False), \
+         patch("subprocess.CREATE_NO_WINDOW", 0x08000000, create=True), \
+         patch("subprocess.CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True), \
+         patch("subprocess.CREATE_BREAKAWAY_FROM_JOB", 0x01000000, create=True), \
+         patch("subprocess.Popen", side_effect=[PermissionError(13, "denied"), proc]) as popen:
+        lock.return_value.held_elsewhere.return_value = False
+        st = background.start(tmp_path)
+
+    first, second = (c.kwargs["creationflags"] for c in popen.call_args_list)
+    assert first & 0x01000000
+    assert second == 0x08000000 | 0x00000200
+    assert st.ends_with_caller
+    assert st.to_json()["endsWithCaller"] is True
 
 
 def test_stop_disables_and_removes_dead_pid(tmp_path: Path):

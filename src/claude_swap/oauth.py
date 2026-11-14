@@ -1002,6 +1002,29 @@ def _header_reading_complete(usage: dict, models: Sequence[str]) -> bool:
     return wanted <= have
 
 
+def unexplained_refusal(usage: dict | None) -> dict | None:
+    """The reading's ``rejected`` entry when no window in it is at its limit.
+
+    A refused request on an account whose 5h, 7d or per-model window shows
+    100% with its reset says nothing that window does not, so displays leave
+    it out; one with every window below its limit (an extra-usage cap, or a
+    model the reading has no window for) is the only sign the account is
+    blocked.
+    """
+    if not isinstance(usage, dict):
+        return None
+    rejected = usage.get("rejected")
+    if not isinstance(rejected, dict):
+        return None
+    windows = [usage.get("five_hour"), usage.get("seven_day"), *(usage.get("scoped") or [])]
+    for window in windows:
+        if isinstance(window, dict):
+            pct = window.get("pct")
+            if isinstance(pct, (int, float)) and pct >= 100 and window.get("resets_at"):
+                return None
+    return rejected
+
+
 def relevant_windows(
     usage: dict | None, models: Sequence[str] = ()
 ) -> list[tuple[str, float, str | None]]:
