@@ -130,8 +130,8 @@ def normalize_account_priority(value: object) -> int:
 class AccountPolicy:
     """Per-account auto-switch overrides, stored in the sequence record.
 
-    Defaults preserve existing behavior. Priority is read only by the
-    opt-in ``priority-consume-first`` strategy.
+    Defaults preserve existing behavior. Priority orders the accounts
+    auto-switch lands on, highest first.
 
     ``threshold``
         This account's own switch-away line, in binding-window utilization

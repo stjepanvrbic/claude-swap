@@ -42,7 +42,6 @@ def _args(**kwargs) -> argparse.Namespace:
         "interval": None,
         "cooldown": None,
         "include_api_key_accounts": None,
-        "strategy": None,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
@@ -73,15 +72,17 @@ class TestLoadSettings:
             "autoswitch": {
                 "threshold": 200,
                 "intervalSeconds": 1,
-                "hysteresisPct": -5,
-                "unhealthyTicks": 0,
+                "activeIntervalSeconds": 1,
+                "accountIntervalSeconds": 1,
+                "minHeadroomPct": -5,
             }
         }))
         loaded = load_settings(tmp_path)
         assert loaded.threshold == 99.9
-        assert loaded.interval_seconds == 15.0  # usage-cache TTL floor
-        assert loaded.hysteresis_pct == 0.0
-        assert loaded.unhealthy_ticks == 1
+        assert loaded.interval_seconds == 15.0
+        assert loaded.active_interval_seconds == 15.0
+        assert loaded.account_interval_seconds == 120.0
+        assert loaded.min_headroom_pct == 0.0
 
     def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({
@@ -109,21 +110,14 @@ class TestLoadSettings:
         )
         assert load_settings(tmp_path).include_api_key_accounts is False
 
-    def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(
-            json.dumps({"autoswitch": {"strategy": "chaos"}})
-        )
-        assert load_settings(tmp_path).strategy == "best"
-
-    def test_consume_first_is_a_valid_strategy(self, tmp_path: Path):
-        settings_path(tmp_path).write_text(
-            json.dumps({"autoswitch": {"strategy": "consume-first"}})
-        )
-        assert load_settings(tmp_path).strategy == "consume-first"
-
-    def test_set_strategy_consume_first(self, tmp_path: Path):
-        set_setting(tmp_path, "autoswitch.strategy", "consume-first")
-        assert load_settings(tmp_path).strategy == "consume-first"
+    def test_keys_of_the_retired_strategies_are_ignored(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {
+            "strategy": "consume-first",
+            "hysteresisPct": 5,
+            "unhealthyTicks": 2,
+            "threshold": 85,
+        }}))
+        assert load_settings(tmp_path) == AutoSwitchSettings(threshold=85.0)
 
 
 class TestSaveSettings:
@@ -306,11 +300,6 @@ class TestSetUnsetSetting:
         raw = json.loads(settings_path(tmp_path).read_text())
         assert raw == {"schemaVersion": 1, "autoswitch": {"threshold": 80.0}}
 
-    def test_set_int_kind_coerces_and_rejects_floats(self, tmp_path: Path):
-        assert set_setting(tmp_path, "autoswitch.unhealthyTicks", "5") == 5
-        with pytest.raises(ConfigError, match="integer"):
-            set_setting(tmp_path, "autoswitch.unhealthyTicks", "3.5")
-
     def test_set_rejects_out_of_range_without_writing(self, tmp_path: Path):
         with pytest.raises(ConfigError, match="between 50 and 99.9"):
             set_setting(tmp_path, "autoswitch.threshold", "200")
@@ -405,10 +394,6 @@ class TestMergedWithCli:
     def test_model_override(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(model="Fable"))
         assert merged.model == "Fable"
-
-    def test_strategy_override(self):
-        merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="consume-first"))
-        assert merged.strategy == "consume-first"
 
 
 class TestAtomicWriteThroughSymlink:

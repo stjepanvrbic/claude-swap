@@ -85,14 +85,13 @@ Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy bes
 
 ### Automatic switching
 
-Let claude-swap watch your usage and switch for you. When the active account's 5-hour or 7-day window reaches the threshold (default 90%), it switches to the account with the most quota left — before you hit the limit, and safe to run while Claude Code is working:
+Let claude-swap watch your usage and switch for you. It keeps Claude Code on one account until that account is used up, since every switch starts the prompt cache cold, then moves it to the best account left — before you hit the limit, and safe to run while Claude Code is working:
 
 ```bash
-cswap auto                     # foreground loop, polls every 60s
-cswap auto --threshold 80      # switch earlier
-cswap auto --weekly-threshold 97   # let the weekly window run higher before switching
+cswap auto                     # foreground loop
+cswap auto --threshold 80      # 5-hour line: switch earlier
+cswap auto --weekly-threshold 97   # line for the 7-day and per-model windows
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
-cswap auto --strategy weekly-first   # spend the soonest-expiring weekly quota first (more strategies below)
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
 cswap auto start               # run it as a detached background worker
@@ -102,37 +101,34 @@ cswap auto resume              # resume switching
 cswap auto stop                # stop the background worker
 ```
 
-`cswap auto start` sets `autoswitch.enabled` and launches a detached worker; `cswap auto stop` clears it and stops the worker (`cswap config set autoswitch.enabled true|false` does the same). `cswap auto pause` keeps the worker alive but makes every automatic check a no-op until `cswap auto resume`: use it before logging into Claude and running `cswap add`. The worker re-reads settings.json every few seconds, so these take effect without a restart. Its log is `autoswitch_background.log` in the backup directory, rotated at 5 MB.
+`cswap auto start` sets `autoswitch.enabled` and launches a detached worker; `cswap auto stop` clears it and stops the worker (`cswap config set autoswitch.enabled true|false` does the same). `cswap auto pause` keeps the worker alive but makes every automatic check a no-op until `cswap auto resume`: use it before logging into Claude and running `cswap add`. The worker re-reads settings.json every few seconds, so these take effect without a restart. Only one auto-switcher runs per backup directory: a second one exits at once. Its log is `autoswitch_background.log` in the backup directory, rotated at 5 MB.
 
 <details>
-<summary>Strategies, per-account controls & behavior</summary>
+<summary>How it decides, per-account controls & behavior</summary>
 
-**Strategies** (`--strategy`, or `cswap config set autoswitch.strategy`):
+**When it switches.** Only when the active account reaches a switch line on one of its windows (`--threshold` for the 5-hour window, `--weekly-threshold` for the 7-day and `--model` windows), when the server refuses it, or 15 minutes before its login ends. A failed usage read never moves you.
 
-| Strategy | Switches | Lands on |
-|---|---|---|
-| `best` (default) | when the active account reaches its threshold | the account with the most quota left |
-| `weekly-first` | same as `best` | the account whose weekly window resets soonest |
-| `consume-first` | at the threshold, and earlier whenever an account that resets sooner has room | the account whose weekly window resets soonest |
-| `priority-consume-first` | whenever a higher-tier account is usable | your highest tier (`cswap priority`), then the soonest weekly reset |
+**Where it lands.** On an account with at least `autoswitch.minHeadroomPct` (default 20) left under each of its lines, chosen by:
 
-The weekly ones exist because weekly quota left unused at its reset is lost.
+1. your priority tier (`cswap priority`, higher first; default 0 for all);
+2. Ultra accounts (no 5-hour window, so nothing stops them before their weekly quota) before the rest;
+3. the weekly window that resets soonest, since quota left at a reset is lost;
+4. the most room left.
+
+The target is confirmed with a fresh probe just before the switch. When no account has that much room it stays until the active account is refused, then takes any account with room left; when none has any, it waits for the earliest reset.
+
+**How it reads usage.** The active account is read every `autoswitch.activeIntervalSeconds` (default 60; every 20s within 5 points of a line) from the rate-limit headers of a one-token request: these never run into the usage endpoint's request limit, which Claude Code itself spends on the active account. With `--model Fable` that request asks Fable, the only way its weekly window appears in the headers. Every other account is read from the usage endpoint every `autoswitch.accountIntervalSeconds` (default 15 min), one per check.
 
 **Per-account controls**
 
 - `cswap disable <num|email>` holds an account out of rotation: auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies skip it until `cswap enable` puts it back. It keeps its login and is still a valid explicit `cswap switch <num|email>` target.
-- `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one.
-- `cswap priority <num|email> <tier>` ranks accounts for `priority-consume-first`: higher tiers (0–1000, default 0) are used first. The other strategies ignore tiers.
+- `cswap threshold <num|email> <pct>` gives one account its own 5-hour line (50–99.9) in place of the global one.
+- `cswap priority <num|email> <tier>` ranks accounts for landing: higher tiers (0–1000, default 0) are used first.
 
 **Good to know**
 
-- **Thresholds are switch-away lines, not hard caps.** With nothing under its line, or the active account at its limit, auto-switch still lands somewhere rather than stall. `priority-consume-first` is the exception: it never lands on an account at or over its line, so it holds and keeps polling.
-- A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping between accounts near the threshold.
-- `--weekly-threshold 97` gives the 7-day and per-model windows their own line, so the weekly budget can run higher than the 5-hour window. `--threshold`, and any per-account threshold, then governs the 5-hour window only.
-- `--model Fable` folds that model's weekly limit into the decision, for when you hit a per-model limit before the account-wide ones. Names are the per-model rows in `cswap list` (e.g. `Fable: 100%`), matched case-insensitively.
-- Accounts with no 5-hour window (Ultra) are judged on their 7-day and `--model` windows alone. Under `best` and `weekly-first`, a switch lands on one ahead of any account with a 5-hour window. A healthy account is never left just to reach one, since every switch starts the prompt cache cold.
+- A cooldown (default 5 min) spaces out switches at a line; a refused account leaves at once.
 - A stored login ends at a fixed time. Auto-switch leaves the active account 15 minutes before its login stops working, and avoids landing on an account whose login ends within 2 hours.
-- If a usage check fails it keeps using the last-known numbers for a limited time while it retries, and an expired token on an idle machine makes it hold rather than fail over.
 - An account whose refresh token has died is quarantined and reported until you [re-add it](#refresh-expired-tokens).
 - API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 
@@ -146,7 +142,7 @@ Defaults like the threshold and cooldown are configurable with `cswap config set
 
 </details>
 
-The exact rules (margins, landing, polling cadence, tier handling) are in [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md).
+The exact rules are in [docs/auto-switch.md](docs/auto-switch.md).
 
 ### Run multiple accounts at the same time (session mode)
 
@@ -228,7 +224,7 @@ cswap enable 2                  # Return a disabled account to rotation
 cswap threshold 2 85            # Switch away from account 2 at 85%, not the global default
 cswap threshold 2 --unset       # Return account 2 to the global default
 cswap threshold                 # Show the global default and every per-account override
-cswap priority 2 100            # Use account 2 before lower tiers (priority-consume-first strategy)
+cswap priority 2 100            # Land on account 2 before lower tiers when auto-switching
 cswap priority 2 --unset        # Return account 2 to tier 0
 cswap priority                  # Show every account's tier
 cswap alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
@@ -413,7 +409,7 @@ cswap add-token --email user@example.com     # optional label override
 <summary>Limits — setup-token usage & API-key accounts</summary>
 
 - **Setup-tokens show `usage unavailable` by default**, because the usage endpoint does not answer them (their scope is inference-only). With `cswap config set usage.headerProbe true`, cswap reads their 5h/7d utilization (and Fable's weekly window) from the rate-limit headers of a 1-output-token Haiku request instead, sent at the normal poll cadence. Each probe is a real (tiny) request on that account's subscription, which is why it is off by default.
-- **What the probe can't do.** Other per-model windows and extra-usage spend are not in those headers. A reading missing the 5h or 7d window (or a window `autoswitch.model` names) is shown but not used for auto-switching. An account the server rejects for quota is marked as at its limit, with no further probe, until the refusal's `Retry-After` passes.
+- **What the probe can't do.** Per-model windows other than Fable's (sent only when the probe asks Fable) and extra-usage spend are not in those headers; auto-switch judges an account on the windows a reading has. An account the server rejects for quota is marked as at its limit, with no further probe, until the refusal's `Retry-After` passes.
 - **API-key accounts.** Any bare `sk-ant-...` value that is not an OAuth token (`sk-ant-oat...`) registers a managed API-key account (the kind Claude Code uses after `/login` with a key). It switches like any other account, but API keys have no subscription quota, so they show no usage and the usage-aware `switch` strategies never skip them as rate-limited. Use keys scoped to a single workspace: a multi-workspace key needs an `anthropic-workspace-id` header on every request, which Claude Code does not add for a stored key.
 
 </details>
@@ -422,7 +418,7 @@ cswap add-token --email user@example.com     # optional label override
 
 ## Documentation
 
-- [docs/auto-switch.md](https://github.com/realiti4/claude-swap/blob/main/docs/auto-switch.md) — the exact auto-switch rules: hysteresis margins, landing rules, per-account thresholds and tiers, polling cadence. Read it to find out why it did or didn't switch.
+- [docs/auto-switch.md](docs/auto-switch.md) — the exact auto-switch rules: when it leaves, where it lands, how it reads usage. Read it to find out why it did or didn't switch.
 - [docs/json-output.md](https://github.com/realiti4/claude-swap/blob/main/docs/json-output.md) — every field in `--json` output, including the optional ones. Read it before writing a script against `cswap list --json` or `cswap auto --json`.
 - [docs/menubar.md](https://github.com/realiti4/claude-swap/blob/main/docs/menubar.md) — how the macOS menu bar runs under launchd: start at login, the wrapper app in `/Applications`, file locations, upgrades, the Login Items switch. Read it when the icon is missing or the service misbehaves.
 

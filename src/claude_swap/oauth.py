@@ -32,6 +32,9 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 USAGE_PROBE_URL = "https://api.anthropic.com/v1/messages"
 USAGE_PROBE_MODEL = "claude-haiku-5-5"
 USAGE_PROBE_API_VERSION = "2023-06-01"
+# The probe model that makes the headers carry Fable's own weekly window
+# (``7d_oi``): a request to any other model reports only 5h and 7d.
+FABLE_PROBE_MODEL = "claude-fable-5-2"
 # OAuth inference requests are only accepted with Claude Code's system prompt.
 USAGE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 
@@ -552,14 +555,16 @@ USAGE_SOURCE_HEADERS = "headers"
 _UNIFIED_WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
 # Per-model weekly buckets in the unified headers → the model display name the
 # usage API's ``weekly_scoped`` limits use, so ``autoswitch.model`` matches
-# them the same way. ``7d_oi`` is Fable's weekly window.
+# them the same way. ``7d_oi`` is Fable's weekly window, sent only on a
+# response to a Fable request (see :data:`FABLE_PROBE_MODEL`).
 _UNIFIED_SCOPED_WINDOWS = (("7d_oi", "Fable"),)
 
 
 def _unified_window(headers, prefix: str) -> tuple[float, str | None] | None:
     """``(utilization %, resets_at ISO)`` of one unified header window, or None
     when its utilization is missing or unusable (a missing reset only drops
-    ``resets_at``)."""
+    ``resets_at``). A window the server reports as ``rejected`` reads as at
+    least 100%: it refuses requests whatever its utilization rounds to."""
     base = f"anthropic-ratelimit-unified-{prefix}"
     try:
         fraction = float(headers.get(f"{base}-utilization"))
@@ -567,7 +572,10 @@ def _unified_window(headers, prefix: str) -> tuple[float, str | None] | None:
         return None
     if not math.isfinite(fraction) or fraction < 0:
         return None
-    return round(fraction * 100, 2), _epoch_header_iso(headers.get(f"{base}-reset"))
+    pct = round(fraction * 100, 2)
+    if headers.get(f"{base}-status") == "rejected":
+        pct = max(pct, 100.0)
+    return pct, _epoch_header_iso(headers.get(f"{base}-reset"))
 
 
 def _unified_window_present(headers, prefix: str) -> bool:
@@ -637,7 +645,9 @@ def parse_unified_ratelimit_headers(headers) -> dict:
     return data
 
 
-def request_usage_via_probe(access_token: str) -> dict:
+def request_usage_via_probe(
+    access_token: str, model: str = USAGE_PROBE_MODEL
+) -> dict:
     """Read utilization from the rate-limit headers of a minimal model request.
 
     Every ``/v1/messages`` response carries the account's unified 5h/7d
@@ -656,7 +666,7 @@ def request_usage_via_probe(access_token: str) -> dict:
     with its Retry-After.
     """
     body = json.dumps({
-        "model": USAGE_PROBE_MODEL,
+        "model": model,
         "max_tokens": 1,
         "system": USAGE_PROBE_SYSTEM,
         "messages": [{"role": "user", "content": "hi"}],
@@ -689,7 +699,9 @@ def request_usage_via_probe(access_token: str) -> dict:
         return data
 
 
-def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
+def _usage_from_probe(
+    access_token: str, context: str, model: str = USAGE_PROBE_MODEL
+) -> "UsageOutcome":
     """Usage from the header probe, classified like an endpoint fetch.
 
     The result is marked ``source: headers`` and keeps the probe's
@@ -700,7 +712,7 @@ def _usage_from_probe(access_token: str, context: str) -> "UsageOutcome":
     one) instead of failing as ``bad-response``.
     """
     try:
-        data = request_usage_via_probe(access_token)
+        data = request_usage_via_probe(access_token, model)
     except Exception as e:
         kind, retry_after = _classify_usage_error(e)
         cause = kind if retry_after is None else f"{kind}, retry-after {retry_after:.0f}s"

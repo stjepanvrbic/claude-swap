@@ -26,7 +26,6 @@ from claude_swap.printer import (
     warning,
 )
 from claude_swap.settings import (
-    AUTOSWITCH_STRATEGIES,
     load_ui_settings,
     load_update_settings,
 )
@@ -701,13 +700,13 @@ def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
 
 
 def _priority_command(argv: list[str]) -> None:
-    """Set, clear, or inspect tiers without enabling the strategy implicitly."""
+    """Set, clear, or inspect the tiers auto-switch picks targets by."""
     parser = argparse.ArgumentParser(
         prog="cswap priority",
         description=(
-            "Set or list account priority tiers for the optional "
-            "priority-consume-first strategy. Higher numbers are used first; "
-            "accounts in the same tier are ordered by soonest weekly reset."
+            "Set or list account priority tiers. When auto-switch has to "
+            "leave an account it takes the highest tier with room first; "
+            "within a tier, Ultra accounts, then the soonest weekly reset."
         ),
     )
     parser.add_argument("account", nargs="?", metavar="NUM|EMAIL|ALIAS")
@@ -731,7 +730,6 @@ def _priority_command(argv: list[str]) -> None:
             print(bolded("Account priorities (higher first; default 0):"))
             for num, policy in switcher.account_policies().items():
                 print(f"  Account-{num}  {switcher.account_email(num)}  {policy.priority}")
-            print(dimmed("Used only by: cswap auto --strategy priority-consume-first"))
             return
         switcher.set_account_priority(args.account, None if args.unset else args.priority)
     except (ValueError, ClaudeSwitchError) as e:
@@ -807,7 +805,7 @@ Defaults live in settings.json in the backup root; flags override them.
         "--interval",
         type=float,
         metavar="SECONDS",
-        help="Poll interval in loop mode (min 15; default 60)",
+        help="How often the loop wakes to decide (min 15; default 15)",
     )
     parser.add_argument(
         "--threshold",
@@ -833,7 +831,10 @@ Defaults live in settings.json in the backup root; flags override them.
         "--cooldown",
         type=float,
         metavar="SECONDS",
-        help="Minimum time between proactive switches (default 300)",
+        help=(
+            "Minimum time between switches, unless the active account is "
+            "refused (default 300)"
+        ),
     )
     parser.add_argument(
         "--model",
@@ -855,19 +856,6 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
-        "--strategy",
-        choices=AUTOSWITCH_STRATEGIES,
-        default=None,
-        help=(
-            "Target selection: 'best' (most quota left; default), "
-            "'weekly-first' (switch at the threshold like best, onto the "
-            "account whose weekly window resets soonest), "
-            "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest), or 'priority-consume-first' (highest account "
-            "priority, then soonest weekly reset; only targets below all switch lines)"
-        ),
-    )
-    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Evaluate and report, but never switch or write state",
@@ -879,7 +867,12 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, pct_label
+    from claude_swap.autoswitch import (
+        AutoSwitchEngine,
+        AutoSwitchEvent,
+        EngineBusy,
+        pct_label,
+    )
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import load_settings, merged_with_cli
 
@@ -931,6 +924,13 @@ Defaults live in settings.json in the backup root; flags override them.
                 )
             )
         sys.exit(engine.run_loop())
+    except EngineBusy as e:
+        if not args.json:
+            error(
+                f"Error: {e}. Watch it with 'cswap auto status', or stop it "
+                "with 'cswap auto stop' first."
+            )
+        sys.exit(1)
     except ClaudeSwitchError as e:
         if args.json:
             print(json.dumps(error_envelope(e)))
@@ -1028,7 +1028,9 @@ Examples:
 
 
 def _auto_worker_command(argv: list[str]) -> None:
-    """Internal foreground worker that `cswap auto start` launches detached."""
+    """The background worker: `cswap auto start` launches it detached, and a
+    service manager can run it directly. Exits 0 at once when another worker
+    already runs, so a supervisor never piles up duplicates."""
     import signal
 
     parser = argparse.ArgumentParser(prog="cswap auto _worker", add_help=False)
@@ -1036,7 +1038,7 @@ def _auto_worker_command(argv: list[str]) -> None:
     args = parser.parse_args(argv)
 
     from claude_swap import background
-    from claude_swap.autoswitch import AutoSwitchEngine, pct_label
+    from claude_swap.autoswitch import AutoSwitchEngine, EngineBusy, pct_label
     from claude_swap.settings import load_settings, reload_settings
 
     try:
@@ -1057,16 +1059,22 @@ def _auto_worker_command(argv: list[str]) -> None:
             else ""
         )
         emit.write(
-            f"Auto-switch background worker running: threshold "
-            f"{pct_label(settings.threshold)}%{weekly}, strategy "
-            f"{settings.strategy}, every {settings.interval_seconds:.0f}s"
+            f"Auto-switch worker {os.getpid()} running: threshold "
+            f"{pct_label(settings.threshold)}%{weekly}, model "
+            f"{settings.model or '-'}, probe {engine.reader.probe_model} every "
+            f"{settings.active_interval_seconds:.0f}s, other accounts every "
+            f"{settings.account_interval_seconds:.0f}s"
         )
-        sys.exit(
-            engine.run_loop(
+        try:
+            code = engine.run_loop(
                 settings_loader=lambda: reload_settings(root),
                 should_continue=lambda current: current.enabled,
             )
-        )
+        except EngineBusy as e:
+            emit.write(f"{e}; worker {os.getpid()} exiting")
+            sys.exit(0)
+        emit.write(f"Auto-switch worker {os.getpid()} stopped")
+        sys.exit(code)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

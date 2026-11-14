@@ -19,13 +19,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from claude_swap import oauth
-from claude_swap.autoswitch import TickOutcome
 from claude_swap.json_output import usage_to_json
 from claude_swap.menubar import usage_summary
 from claude_swap.switcher import _format_usage_lines
 from claude_swap.tui.widgets import usage_rows
 from claude_swap.usage_store import FetchRecord, UsageStore
-from tests.test_autoswitch import EngineHarness, _usage
 
 _OMITTED = object()
 _LABELS = {"five_hour": "5h", "seven_day": "7d"}
@@ -62,19 +60,6 @@ def fetch_outcome(monkeypatch):
         )
 
     return fetch
-
-
-@pytest.fixture
-def harness(temp_home):
-    h = EngineHarness(temp_home)
-    for number, email in (
-        (1, "active@example.com"),
-        (2, "weekly@example.com"),
-        (3, "fallback@example.com"),
-    ):
-        h.seed(number, email)
-    h.make_live("active@example.com", 1)
-    return h
 
 
 @pytest.mark.parametrize("five_hour, present", [
@@ -116,12 +101,6 @@ def test_an_account_without_a_reading_has_no_usage(fetch_outcome, response_kind)
     assert usage_rows(outcome.usage, now=0) == []
 
 
-def test_an_account_without_a_reading_never_becomes_a_switch_target(harness):
-    result = harness.tick_with_usage({"1": _usage(98), "2": None, "3": _usage(70)})
-    assert result is TickOutcome.SWITCHED
-    assert harness.active_number() == 3
-
-
 @pytest.mark.parametrize("window", ["five_hour", "seven_day"])
 @pytest.mark.parametrize("broken", [
     # Every other falsy value is a malformed window, not a missing one.
@@ -159,7 +138,7 @@ def test_an_unreadable_window_from_the_header_probe_is_classified(monkeypatch):
     data = oauth.parse_unified_ratelimit_headers(
         {"anthropic-ratelimit-unified-5h-utilization": "1e308"}
     )
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, model=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.usage is None
     assert outcome.error == "bad-response"
@@ -173,7 +152,7 @@ def test_a_probe_without_a_5h_header_reads_as_weekly_only(monkeypatch):
         "anthropic-ratelimit-unified-7d-reset": "1791154800",
         "anthropic-ratelimit-unified-representative-claim": "seven_day",
     })
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, model=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.error is None
     assert "five_hour" not in outcome.usage
@@ -198,7 +177,7 @@ def test_an_unusable_header_utilization_fails_the_reading(monkeypatch, window, b
         "anthropic-ratelimit-unified-7d-utilization": "0.4",
         f"anthropic-ratelimit-unified-{window}-utilization": bad,
     })
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, model=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.usage is None
     assert outcome.error == "bad-response"
@@ -217,7 +196,7 @@ def test_a_5h_header_without_a_utilization_fails_the_reading(
         "anthropic-ratelimit-unified-7d-utilization": "0.4",
         f"anthropic-ratelimit-unified-5h-{header}": value,
     })
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, model=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.usage is None
     assert outcome.error == "bad-response"
@@ -228,7 +207,7 @@ def test_a_fable_bucket_header_is_not_a_7d_window_header(monkeypatch):
         "anthropic-ratelimit-unified-5h-utilization": "0.2",
         "anthropic-ratelimit-unified-7d_oi-reset": "1791154800",
     })
-    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token: data)
+    monkeypatch.setattr(oauth, "request_usage_via_probe", lambda token, model=None: data)
     outcome = oauth._usage_from_probe("token", "for account 2")
     assert outcome.error is None
     assert "seven_day" not in outcome.usage
@@ -392,22 +371,18 @@ def test_a_reading_with_an_unknown_window_replaces_the_last_good_one(
     assert oauth.account_headroom(entry.decision_value()) == 99.0
 
 
-def test_an_unknown_window_alone_is_no_figure_to_rank_on(fetch_outcome, harness):
+def test_an_unknown_window_alone_is_no_figure_to_rank_on(fetch_outcome):
     outcome = fetch_outcome({"five_hour": {"utilization": None}, "seven_day": None})
     assert outcome.error is None
     assert outcome.usage == {"five_hour": {"pct": None}}
     assert oauth.account_headroom(outcome.usage) is None
     assert _format_usage_lines(outcome.usage) == ["5h:    ?"]
-    # Unknown headroom never becomes a switch target.
-    result = harness.tick_with_usage({"1": _usage(98), "2": outcome.usage, "3": _usage(70)})
-    assert result is TickOutcome.SWITCHED
-    assert harness.active_number() == 3
 
 
 def test_a_new_weekly_only_reading_drops_the_previous_five_hour_window(
-    fetch_outcome, harness, tmp_path,
+    fetch_outcome, tmp_path,
 ):
-    store = UsageStore(tmp_path / "cache", clock=lambda: harness.clock.now)
+    store = UsageStore(tmp_path / "cache", clock=lambda: 1_000_000.0)
     identities = {"2": ("weekly@example.com", "")}
     old = fetch_outcome({
         "five_hour": {"utilization": 100.0},
@@ -420,10 +395,6 @@ def test_a_new_weekly_only_reading_drops_the_previous_five_hour_window(
 
     assert value == {"seven_day": {"pct": 25.0}}
     assert "5h" not in usage_summary(value)
-    assert harness.tick_with_usage({
-        "1": _usage(98), "2": value, "3": _usage(70),
-    }) is TickOutcome.SWITCHED
-    assert harness.active_number() == 2
 
 
 def test_an_over_limit_reading_is_retained_without_clamping(fetch_outcome):

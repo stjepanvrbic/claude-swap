@@ -26,9 +26,6 @@ from claude_swap.fsutil import atomic_write_text, publish_target
 
 SETTINGS_SCHEMA_VERSION = 1
 SETTINGS_FILENAME = "settings.json"
-AUTOSWITCH_STRATEGIES = (
-    "best", "weekly-first", "consume-first", "priority-consume-first",
-)
 
 _logger = logging.getLogger("claude-swap")
 
@@ -38,46 +35,35 @@ class AutoSwitchSettings:
     """Policy knobs for the auto-switch engine (``cswap auto``).
 
     ``threshold`` is the switch line for the 5-hour window and, while
-    ``weekly_threshold`` is unset, for every window: each of an account's
-    usage windows (5h, 7d, and any per-model window named by ``model``) is
-    judged against its own line, and the engine looks for a better account
-    once any of them is at or over it. 90 rather than 95 leaves margin for the
-    macOS ~30s Keychain pickup tail and for heavy subagent turns burning past
-    the mark before a swap lands. ``weekly_threshold`` gives the 7-day window
-    and the per-model windows (they all reset weekly) their own line: the
-    weekly window is the budget, so it is worth running closer to its ceiling
-    than the 5-hour window, which recycles in hours. A proactive candidate
-    must itself sit below each of its lines (never land somewhere that
-    re-triggers next tick) and beat the active account by at least
-    ``hysteresis_pct`` points of headroom measured against those lines, so two
-    accounts hovering at the line never ping-pong while a strictly better
-    account is always taken.
+    ``weekly_threshold`` is unset, for every window; ``weekly_threshold`` is
+    the line for the 7-day window and the per-model windows named by
+    ``model``. The engine keeps the active account until one of its windows
+    reaches its line, then moves to an account with at least
+    ``min_headroom_pct`` left under each of its own lines.
 
-    ``enabled``/``paused`` are the detached background worker's control state
-    (``cswap auto start|stop|pause|resume``), not policy: ``enabled`` is what
-    the worker supervisor persists across restarts, while ``paused`` makes
-    each automatic tick a no-op.
+    ``active_interval_seconds`` is how often the active account is probed,
+    ``account_interval_seconds`` how often each other account is read from
+    the usage endpoint, and ``interval_seconds`` how often the loop wakes to
+    decide. ``probe_model`` is the model the probe asks (by default Fable
+    when ``model`` names it, since only a Fable response reports Fable's
+    window, else Haiku).
+
+    ``enabled``/``paused`` are the background worker's control state
+    (``cswap auto start|stop|pause|resume``), not policy.
     """
 
     enabled: bool = False
     paused: bool = False
     threshold: float = 90.0
-    # Switch line for the 7-day window and every per-model scoped window.
-    # None = ``threshold`` governs every window (the default, today's policy).
     weekly_threshold: float | None = None
-    interval_seconds: float = 60.0
+    interval_seconds: float = 15.0
+    active_interval_seconds: float = 60.0
+    account_interval_seconds: float = 900.0
+    min_headroom_pct: float = 20.0
     cooldown_seconds: float = 300.0
-    hysteresis_pct: float = 10.0
-    strategy: str = "best"  # Opt-in alternatives are in AUTOSWITCH_STRATEGIES.
     include_api_key_accounts: bool = False
-    unhealthy_ticks: int = 3
-    # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
-    # or "all" for every scoped window an account reports. Each named model's
-    # per-model weekly limit is folded into the binding window, so the engine
-    # switches off an account whose model quota is exhausted even while its
-    # 5h/7d windows still have headroom. None = account-wide 5h/7d only
-    # (default).
     model: str | None = None
+    probe_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -182,32 +168,37 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
-            help="Poll interval for the cswap auto loop, in seconds",
+            help="How often the auto-switch loop wakes to decide, in seconds",
+        ),
+        SettingSpec(
+            "autoswitch", "activeIntervalSeconds", "active_interval_seconds",
+            "float", 15.0, 600.0,
+            help="How often the active account's usage is probed, in seconds",
+        ),
+        SettingSpec(
+            "autoswitch", "accountIntervalSeconds", "account_interval_seconds",
+            "float", 120.0, 86400.0,
+            help="How often each other account's usage is read, in seconds",
+        ),
+        SettingSpec(
+            "autoswitch", "minHeadroomPct", "min_headroom_pct", "float", 0.0, 50.0,
+            help="A switch target needs this many pct left under each of its lines",
         ),
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
-            help="Minimum seconds between proactive switches",
-        ),
-        SettingSpec(
-            "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="A target must beat the active account by this many pct of headroom",
-        ),
-        SettingSpec(
-            "autoswitch", "strategy", "strategy", "choice",
-            choices=AUTOSWITCH_STRATEGIES,
-            help="How auto-switch picks the target account",
+            help="Minimum seconds between switches, unless the active account is refused",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",
             help="Allow rotating onto managed API-key accounts (bill per token)",
         ),
         SettingSpec(
-            "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
-            help="Consecutive failed polls before an account is unhealthy",
-        ),
-        SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "probeModel", "probe_model", "string",
+            help="Model the usage probe asks (default: Fable when model names it, else Haiku)",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -626,7 +617,6 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
-        ("strategy", "strategy"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

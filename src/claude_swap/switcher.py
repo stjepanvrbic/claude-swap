@@ -1873,6 +1873,25 @@ class ClaudeAccountSwitcher:
 
     # -- public accessors for the auto-switch engine -----------------------
 
+    def active_credentials(self) -> str:
+        """Claude Code's live credential JSON, or "" when there is none."""
+        return self._read_active_credentials().value or ""
+
+    def usage_store(self) -> UsageStore:
+        return self._usage_store
+
+    def usage_identities(
+        self, numbers: list[str] | None = None
+    ) -> dict[str, tuple[str, str]]:
+        """``{number: (email, organization uuid)}``, the identity the usage
+        store keys each slot's row on, for ``numbers`` or every slot."""
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        return {
+            num: (info.get("email", ""), info.get("organizationUuid", "") or "")
+            for num, info in accounts.items()
+            if numbers is None or num in numbers
+        }
+
     def usage_by_account(self) -> dict[str, dict | str | None]:
         """Public wrapper: account number → decision-grade usage value.
 
@@ -2318,8 +2337,7 @@ class ClaudeAccountSwitcher:
         if changed:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
-        print(f"Account-{account_num} ({email}) priority: {normalized} "
-              "(used by priority-consume-first).")
+        print(f"Account-{account_num} ({email}) priority: {normalized}")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         """Hold an account out of rotation (``disabled=True``) or return it.

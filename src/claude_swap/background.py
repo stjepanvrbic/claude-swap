@@ -2,7 +2,8 @@
 
 ``start``/``stop``/``pause``/``resume``/``status`` manage one worker process
 per backup root (``cswap auto start`` launches ``cswap auto _worker``
-detached), recorded in a pid file. The worker writes its events through
+detached). The worker holds the auto-switch lock while it runs, so a second
+one exits at once and "running" is whether the lock is held. The worker writes its events through
 :func:`event_logger`, a size-rotated log, and anything it prints to stderr
 (a crash traceback) lands in a separate file.
 
@@ -23,6 +24,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_swap.locking import InstanceLock
 from claude_swap.settings import load_settings, set_setting
 
 PID_FILENAME = "autoswitch_background.pid"
@@ -33,6 +35,8 @@ STDERR_FILENAME = "autoswitch_background.err"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 3
 STDERR_MAX_BYTES = 1024 * 1024
+# How long `start` waits to see the new worker take the lock.
+START_WAIT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -96,71 +100,32 @@ def event_logger(backup_root: Path) -> EventLog:
     return EventLog(log_path(backup_root))
 
 
-def _read_pid(path: Path) -> int | None:
+def _lock(backup_root: Path) -> InstanceLock:
+    # Imported here: autoswitch imports this module's settings helpers.
+    from claude_swap.autoswitch import LOCK_FILENAME
+
+    return InstanceLock(backup_root / LOCK_FILENAME)
+
+
+def _remove_legacy_pid(backup_root: Path) -> None:
     try:
-        raw = path.read_text(encoding="utf-8").strip()
+        (backup_root / PID_FILENAME).unlink()
     except OSError:
-        return None
-    try:
-        pid = int(raw)
-    except ValueError:
-        return None
-    return pid if pid > 0 else None
-
-
-def _write_pid(path: Path, pid: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{pid}\n", encoding="utf-8")
-    if sys.platform != "win32":
-        os.chmod(path, 0o600)
-
-
-def _remove_pid(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
         pass
 
 
-def _process_running(pid: int | None) -> bool:
-    if pid is None:
-        return False
-    if sys.platform == "win32":
-        try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x1000, False, pid)
-            if not handle:
-                return False
-            code = ctypes.c_ulong()
-            try:
-                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                    return False
-                return code.value == 259
-            finally:
-                kernel32.CloseHandle(handle)
-        except Exception:
-            return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def status(backup_root: Path) -> BackgroundStatus:
-    path = pid_path(backup_root)
+    """Running means some process holds the auto-switch lock: a worker, a
+    foreground ``cswap auto``, or a TUI/menu bar engine."""
+    lock = _lock(backup_root)
     settings = load_settings(backup_root)
-    pid = _read_pid(path)
+    running = lock.held_elsewhere()
     return BackgroundStatus(
         enabled=settings.enabled,
         paused=settings.paused,
-        pid=pid,
-        running=_process_running(pid),
-        pid_path=path,
+        pid=lock.holder_pid() if running else None,
+        running=running,
+        pid_path=lock.pid_path,
         log_path=log_path(backup_root),
     )
 
@@ -170,7 +135,7 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
     set_setting(backup_root, "autoswitch.enabled", "true")
     if current.running:
         return status(backup_root)
-    _remove_pid(current.pid_path)
+    _remove_legacy_pid(backup_root)
 
     err = stderr_path(backup_root)
     err.parent.mkdir(parents=True, exist_ok=True)
@@ -207,35 +172,47 @@ def start(backup_root: Path, *, debug: bool = False) -> BackgroundStatus:
             env=env,
             **popen_kwargs,
         )
-    _write_pid(current.pid_path, proc.pid)
+    # Report what actually happened: the worker holds the lock once its
+    # engine starts, or has exited (another engine won the race, or it
+    # failed and said why in the error log).
+    deadline = time.monotonic() + START_WAIT_S
+    while time.monotonic() < deadline:
+        st = status(backup_root)
+        if st.running or proc.poll() is not None:
+            return st
+        time.sleep(0.1)
     return status(backup_root)
 
 
 def stop(
     backup_root: Path,
     *,
-    timeout: float = 5.0,
+    timeout: float = 15.0,
     persist: bool = True,
 ) -> BackgroundStatus:
+    """Stop whatever holds the auto-switch lock: SIGTERM, which ends the
+    loop between ticks, then a kill if it is still there at ``timeout``."""
     if persist:
         set_setting(backup_root, "autoswitch.enabled", "false")
+    _remove_legacy_pid(backup_root)
     current = status(backup_root)
     if not current.running or current.pid is None:
-        _remove_pid(current.pid_path)
-        return status(backup_root)
-
+        return current
     try:
         os.kill(current.pid, signal.SIGTERM)
     except OSError:
-        _remove_pid(current.pid_path)
         return status(backup_root)
-
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not _process_running(current.pid):
-            _remove_pid(current.pid_path)
+        if not status(backup_root).running:
             return status(backup_root)
         time.sleep(0.1)
+    if sys.platform != "win32":
+        try:
+            os.kill(current.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        time.sleep(0.5)
     return status(backup_root)
 
 

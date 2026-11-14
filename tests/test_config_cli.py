@@ -46,19 +46,20 @@ class TestConfigList:
             "autoswitch.threshold",
             "autoswitch.weeklyThreshold",
             "autoswitch.intervalSeconds",
+            "autoswitch.activeIntervalSeconds",
+            "autoswitch.accountIntervalSeconds",
+            "autoswitch.minHeadroomPct",
             "autoswitch.cooldownSeconds",
-            "autoswitch.hysteresisPct",
-            "autoswitch.strategy",
             "autoswitch.includeApiKeyAccounts",
-            "autoswitch.unhealthyTicks",
             "autoswitch.model",
+            "autoswitch.probeModel",
             "ui.theme",
             "run.shareHistory",
             "updates.check",
             "usage.headerProbe",
         ):
             assert key in out
-        assert out.count("(default)") == 15
+        assert out.count("(default)") == 16
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -85,7 +86,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 15
+        assert len(by_key) == 16
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back
@@ -178,15 +179,10 @@ class TestConfigValidation:
         assert code == 1
         assert "expects a number" in err
 
-    def test_int_key_rejects_float(self, temp_home, capsys):
-        code, _, err = _run(["set", "autoswitch.unhealthyTicks", "3.5"], capsys)
+    def test_bad_choice_exits_1(self, temp_home, capsys):
+        code, _, err = _run(["set", "ui.theme", "chaos"], capsys)
         assert code == 1
-        assert "expects an integer" in err
-
-    def test_bad_strategy_exits_1(self, temp_home, capsys):
-        code, _, err = _run(["set", "autoswitch.strategy", "chaos"], capsys)
-        assert code == 1
-        assert "must be one of: best" in err
+        assert "must be one of: dark" in err
 
     def test_unknown_key_json_error_envelope(self, temp_home, capsys):
         code, out, _ = _run(["--json", "get", "autoswitch.bogus"], capsys)
