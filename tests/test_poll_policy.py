@@ -448,7 +448,9 @@ class TestCadenceAfterA429Run:
         assert interval == poll_policy.ACTIVE_MAX_INTERVAL_S
 
     @staticmethod
-    def _plans(temp_home, new_usage: dict) -> float:
+    def _plans(
+        temp_home, new_usage: dict, *, active: bool = True, prev_interval: float = 1800.0
+    ) -> float:
         import time
 
         from claude_swap.switcher import ClaudeAccountSwitcher
@@ -461,10 +463,10 @@ class TestCadenceAfterA429Run:
             last_good={"seven_day": {"pct": 40.0},
                        "scoped": [{"name": "Fable", "pct": 86.0}]},
             fetched_at=now - 300,
-            poll_interval_s=1800.0,
+            poll_interval_s=prev_interval,
             last_429_at=now - 600,
         )
-        info = (2, "a@example.com", "", "", True, "", "")
+        info = (2, "a@example.com", "", "", active, "", "")
         plans = switcher._plans_after_fetch(
             {"2": FetchRecord(usage=new_usage)}, {"2": before}, {"2": info}
         )
@@ -477,6 +479,18 @@ class TestCadenceAfterA429Run:
             "source": "headers",
         })
         assert interval == poll_policy.URGENT_INTERVAL_S
+
+    def test_an_inactive_probe_fallback_keeps_the_429_pacing(self, temp_home):
+        # The fallback ran after an endpoint 429, and the next read tries the
+        # endpoint again first.
+        # From 300 s, a moving account would halve to 180 s without that
+        # pacing; with it the interval only grows.
+        interval = self._plans(temp_home, {
+            "seven_day": {"pct": 42.0},
+            "scoped": [{"name": "Fable", "pct": 90.0}],
+            "source": "headers",
+        }, active=False, prev_interval=300.0)
+        assert interval >= poll_policy.POST_429_MIN_INTERVAL_S
 
     def test_an_endpoint_reading_still_honours_the_429_budget(self, temp_home):
         interval = self._plans(temp_home, {

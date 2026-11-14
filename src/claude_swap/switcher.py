@@ -5865,14 +5865,19 @@ class ClaudeAccountSwitcher:
             if rec.sentinel is not None or rec.error is not None:
                 continue
             before = pre.get(num)
-            # A 429 is the usage endpoint's budget; a reading taken from the
-            # header probe never spent it, so it does not slow the cadence.
-            from_probe = (
-                isinstance(rec.usage, dict)
+            # A 429 is the usage endpoint's budget. The active account is read
+            # from the header probe first and never spends it then, so its
+            # cadence ignores that history; any other account's probe reading
+            # came after an endpoint attempt, and the next one tries the
+            # endpoint again, so it keeps the 429 pacing.
+            is_active = bool(info_by_num[num][4])
+            probe_first = (
+                is_active
+                and isinstance(rec.usage, dict)
                 and rec.usage.get("source") == oauth.USAGE_SOURCE_HEADERS
             )
             recent_429 = (
-                not from_probe and before is not None and before.recent_429(now)
+                not probe_first and before is not None and before.recent_429(now)
             )
             plans[num] = poll_policy.plan_after_fetch(
                 prev_interval_s=before.poll_interval_s if before else None,
