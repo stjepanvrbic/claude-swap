@@ -298,18 +298,21 @@ def last_seen_note(entry: UsageEntry) -> str | None:
     )
 
 
-def _entry_for_plan(entry: UsageEntry, record: dict | None) -> UsageEntry:
+def _entry_for_plan(
+    entry: UsageEntry, record: dict | None, now: float
+) -> UsageEntry:
     """``entry`` served through its plan: windows the plan has, only.
 
     The plan is the one place that knows an Ultra account has no 5-hour
     limit, whatever window the API still reports for it (see
     :func:`subscription.reading_for_plan`). Applied where every reading
     leaves the collector, so no surface and no decision can read a different
-    set of windows than another. A slot with no plan record is served
-    untouched.
+    set of windows than another. A slot with no plan record, or one too old
+    to decide limits (:func:`subscription.windows_plan`), is served untouched.
     """
-    plan = record.get("plan") if isinstance(record, dict) else None
-    usage = subscription.reading_for_plan(entry.last_good, plan)
+    usage = subscription.reading_for_plan(
+        entry.last_good, subscription.windows_plan(record, now)
+    )
     if usage is entry.last_good:
         return entry
     return dataclasses.replace(entry, last_good=usage)
@@ -5674,6 +5677,11 @@ class ClaudeAccountSwitcher:
         the same plan. A failed fetch only updates the entry's error/backoff
         fields, so the last-good measurement keeps being served
         (stale-on-error).
+
+        Readings leave here served through their subscription plan, which the
+        pass refreshes on the same ``fetch`` eligibility — the plan decides
+        which windows a reading carries, so no path may collect a reading
+        without keeping the plan behind it current.
         """
         store = self._usage_store
         identities = {
@@ -5788,10 +5796,24 @@ class ClaudeAccountSwitcher:
         # Served through the plan: a window the account's plan does not have
         # (an Ultra account's leftover session window) gates nothing, and the
         # stored row keeps the reading as fetched.
-        plans = self._stored_subscription_plans(accounts_info)
+        #
+        # Refreshed here, after the usage pass, rather than read from the
+        # store: the plan now decides which windows a reading is served with,
+        # so every caller that collects a reading — the auto engine above all,
+        # which reaches no other surface — has to be a caller that keeps the
+        # plan current, and the pass that refreshes a record has to be the pass
+        # that uses it. ``fetch`` carries through, so a store-only pass stays
+        # store-only. The usage pass first, because a plan read needs a valid
+        # access token and that is what refreshes one. A caller that wants the
+        # records too asks again: a record this pass just refreshed is fresh,
+        # and one it could not refresh is parked, so the second call reaches
+        # the network for nothing it did not already try.
+        plans = self._plans_for_pass(accounts_info, fetch)
+        now = store.clock()
         return {
             num: with_sentinel(
-                _entry_for_plan(entries[num], plans.get(num)), sentinels.get(num)
+                _entry_for_plan(entries[num], plans.get(num), now),
+                sentinels.get(num),
             )
             for num in info_by_num
         }

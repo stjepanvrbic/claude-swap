@@ -1110,6 +1110,95 @@ class TestServedWindows:
         stored = switcher._usage_store.entries({"1": ("a@x", "o1")})["1"]
         assert stored.last_good["five_hour"] == {"pct": 19.0}
 
+    def test_a_record_too_old_to_refresh_stops_deciding_limits(self, switcher):
+        """A profile endpoint that keeps refusing must not leave an Ultra
+        record hiding a 5-hour limit the account has again."""
+        info = [_info(1, "a@x", "o1", False, _creds("live", _future_ms()))]
+        _seed_reading(switcher, self.READING)
+        switcher._subscription_store().save({
+            subscription.identity_key("a@x", "o1"): {
+                "plan": ULTRA,
+                "fetchedAt": switcher._usage_store.clock(),
+                # Parked on a retry, so no pass can refresh it.
+                "retryAt": switcher._usage_store.clock() + 24 * 3600,
+            }
+        })
+        switcher._usage_store.clock.now += subscription.PLAN_TRUST_MAX_AGE_S
+
+        entry = switcher._collect_usage_entries(info, fetch=set())["1"]
+        assert entry.last_good["five_hour"] == {"pct": 19.0}
+
+    def test_a_record_inside_the_trust_age_still_decides(self, switcher):
+        info = [_info(1, "a@x", "o1", False, _creds("live", _future_ms()))]
+        _seed_reading(switcher, self.READING)
+        switcher._subscription_store().save({
+            subscription.identity_key("a@x", "o1"): {
+                "plan": ULTRA,
+                "fetchedAt": switcher._usage_store.clock(),
+                "retryAt": switcher._usage_store.clock() + 24 * 3600,
+            }
+        })
+        switcher._usage_store.clock.now += subscription.PLAN_TRUST_MAX_AGE_S - 1
+
+        entry = switcher._collect_usage_entries(info, fetch=set())["1"]
+        assert "five_hour" not in entry.last_good
+
+
+class TestTheCollectingPassKeepsThePlanCurrent:
+    """The auto engine reaches no other surface: collecting a reading has to
+    be what refreshes the plan that decides the reading's windows."""
+
+    def _info(self):
+        return [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+
+    def _record(self, switcher, plan):
+        switcher._subscription_store().save({
+            subscription.identity_key("a@x", "o1"): {
+                "plan": plan, "fetchedAt": switcher._usage_store.clock(),
+            }
+        })
+
+    @pytest.fixture(autouse=True)
+    def _no_usage_network(self, switcher, monkeypatch):
+        """These passes are about the plan: the usage row is served from the
+        store, and nothing here reaches the usage endpoint."""
+        monkeypatch.setattr(switcher, "_run_usage_fetches", lambda infos, pre: {})
+
+    def test_a_downgrade_restores_the_window_on_the_engines_own_path(
+        self, switcher, monkeypatch
+    ):
+        self._record(switcher, ULTRA)
+        _seed_reading(switcher, {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 5.0}})
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(MAX_5X))
+        switcher._usage_store.clock.now += subscription.CONTRADICTED_PLAN_TTL_S
+
+        entry = switcher._collect_usage_entries(self._info())["1"]
+        assert entry.last_good["five_hour"] == {"pct": 99.0}
+
+    def test_the_refreshed_record_decides_the_same_pass_that_read_it(
+        self, switcher, monkeypatch
+    ):
+        """No pass may serve a window the plan it just read says is not there."""
+        self._record(switcher, MAX_5X)
+        _seed_reading(switcher, {"five_hour": {"pct": 19.0}, "seven_day": {"pct": 5.0}})
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(ULTRA))
+        switcher._usage_store.clock.now += subscription.PLAN_TTL_S
+
+        entry = switcher._collect_usage_entries(self._info())["1"]
+        assert "five_hour" not in entry.last_good
+
+    def test_a_store_only_pass_makes_no_profile_call(self, switcher, monkeypatch):
+        self._record(switcher, ULTRA)
+        _seed_reading(switcher, {"five_hour": {"pct": 19.0}})
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(MAX_5X)
+        )
+        switcher._usage_store.clock.now += 24 * 3600
+
+        switcher._collect_usage_entries(self._info(), fetch=set())
+        assert calls == []
+
 
 class TestContradictedRecordIsReread:
     def _info(self):

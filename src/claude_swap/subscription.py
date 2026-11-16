@@ -121,6 +121,12 @@ _SESSION_LIMIT_FREE_PLANS = frozenset({"ultra"})
 # record is trusted for when nothing disputes it.
 CONTRADICTED_PLAN_TTL_S = 600
 
+# How old a record may be and still decide which windows a reading is served
+# with (:func:`windows_plan`). The same bound the label is marked stale at, so
+# a record that stops deciding limits is also the one that starts showing its
+# age.
+PLAN_TRUST_MAX_AGE_S = 2 * PLAN_TTL_S
+
 
 _KEPT_FIELDS = (
     ("organization_type", "organizationType"),
@@ -256,6 +262,26 @@ def has_session_limit(plan: dict | None) -> bool:
     return not (
         isinstance(name, str) and name.strip().lower() in _SESSION_LIMIT_FREE_PLANS
     )
+
+
+def windows_plan(record: object, now: float) -> dict | None:
+    """The plan a record may decide served windows by, or None for the reading
+    as fetched.
+
+    A label a record is always good for: an old one reads as old and says so.
+    Taking a limit *out* of a reading is a larger promise, and only a current
+    record can make it — an account that has a 5-hour limit again (a downgrade
+    from Ultra) says so through the profile, and nothing else, so a record left
+    behind by a profile endpoint that keeps refusing would go on hiding the one
+    limit the switcher exists to act on. Past
+    :data:`PLAN_TRUST_MAX_AGE_S` the reading is served as fetched instead,
+    which is what every reading was served as before plans decided anything.
+    """
+    if not valid_record(record):
+        return None
+    if now - record["fetchedAt"] >= PLAN_TRUST_MAX_AGE_S:
+        return None
+    return record["plan"]
 
 
 def reading_for_plan(usage: dict | None, plan: dict | None) -> dict | None:
