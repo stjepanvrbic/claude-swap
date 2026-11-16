@@ -1,4 +1,8 @@
-"""Subscription plan per account, for display only (#350).
+"""Subscription plan per account: its label, and which limits it has.
+
+Beyond the label it names one fact a usage reading cannot be trusted for
+on its own — whether the account has a 5-hour (session) limit at all. See
+:func:`has_session_limit` and :func:`reading_for_plan`.
 
 The plan comes from ``GET /api/oauth/profile`` — the same endpoint
 :func:`oauth.fetch_oauth_profile` calls to resolve identity. That function
@@ -102,6 +106,27 @@ _ORG_TYPE_LABELS = {
     "claude_enterprise": "Enterprise",
     "claude_pro": "Pro",
 }
+
+# Plans with no 5-hour ("session") limit, by the server's own plan name.
+# Only Ultra: measured across ten accounts, every Ultra one reports
+# ``five_hour: null`` and no ``session`` entry in ``limits``, while Max 5x and
+# Team accounts report both. The name is the only field that says so — Ultra
+# shares the ``default_claude_max_20x`` tier with Max 20x, which is gated by a
+# 5-hour window like every other Max plan.
+_SESSION_LIMIT_FREE_PLANS = frozenset({"ultra"})
+
+# TTL for a record the account's own usage reading contradicts (below). The
+# profile endpoint answers a plan change immediately; this is how long a
+# disagreement may stand before the record is read again, against the hour a
+# record is trusted for when nothing disputes it.
+CONTRADICTED_PLAN_TTL_S = 600
+
+# How old a record may be and still decide which windows a reading is served
+# with (:func:`windows_plan`). The same bound the label is marked stale at, so
+# a record that stops deciding limits is also the one that starts showing its
+# age.
+PLAN_TRUST_MAX_AGE_S = 2 * PLAN_TTL_S
+
 
 _KEPT_FIELDS = (
     ("organization_type", "organizationType"),
@@ -222,6 +247,79 @@ def is_expired(plan: dict | None) -> bool:
         and plan.get("subscriptionStatus") == "canceled"
         and plan.get("tier") == FREE_TIER
     )
+
+
+def has_session_limit(plan: dict | None) -> bool:
+    """Whether this plan is gated by a 5-hour (session) window.
+
+    True for every plan but the ones known to have none, so a plan name this
+    module has never seen keeps the window it reports rather than silently
+    losing a limit that does bind it.
+    """
+    if not plan:
+        return True
+    name = plan.get("planDisplayName")
+    return not (
+        isinstance(name, str) and name.strip().lower() in _SESSION_LIMIT_FREE_PLANS
+    )
+
+
+def windows_plan(record: object, now: float) -> dict | None:
+    """The plan a record may decide served windows by, or None for the reading
+    as fetched.
+
+    A label a record is always good for: an old one reads as old and says so.
+    Taking a limit *out* of a reading is a larger promise, and only a current
+    record can make it — an account that has a 5-hour limit again (a downgrade
+    from Ultra) says so through the profile, and nothing else, so a record left
+    behind by a profile endpoint that keeps refusing would go on hiding the one
+    limit the switcher exists to act on. Past
+    :data:`PLAN_TRUST_MAX_AGE_S` the reading is served as fetched instead,
+    which is what every reading was served as before plans decided anything.
+    """
+    if not valid_record(record):
+        return None
+    if now - record["fetchedAt"] >= PLAN_TRUST_MAX_AGE_S:
+        return None
+    return record["plan"]
+
+
+def reading_for_plan(usage: dict | None, plan: dict | None) -> dict | None:
+    """``usage`` with any window the plan does not have taken out.
+
+    The API keeps reporting the 5-hour window that was open when a plan
+    changed until that window resets, so an account that is Ultra now can
+    still be handed a session window for hours. It gates nothing — an Ultra
+    account is stopped by its weekly quota alone — and a window that is shown
+    but does not bind is as wrong as one that binds unseen, so it is dropped
+    from the served reading. The stored row keeps the reading as fetched.
+
+    Returns ``usage`` itself when nothing is dropped, which is what callers
+    compare against to leave their entry untouched.
+    """
+    if not isinstance(usage, dict) or "five_hour" not in usage:
+        return usage
+    if has_session_limit(plan):
+        return usage
+    return {key: value for key, value in usage.items() if key != "five_hour"}
+
+
+def contradicts_plan(usage: dict | None, plan: dict | None) -> bool:
+    """Whether a reading disagrees with the record about the 5-hour limit.
+
+    Whether the account reports a session window is the one plan fact a usage
+    reading carries, so a disagreement is the only evidence of a plan change
+    that arrives without reading the profile again: a record with a session
+    limit whose account reports no window (an upgrade to Ultra), or one
+    without whose account reports one (a downgrade, or the window an upgrade
+    left open). Either way the record is read again on
+    :data:`CONTRADICTED_PLAN_TTL_S` rather than the billing-cadence TTL — on
+    an upgrade so the label stops naming the old plan, and on a downgrade so
+    a limit that binds again is not hidden for the rest of the hour.
+    """
+    if not isinstance(usage, dict) or not isinstance(plan, dict):
+        return False
+    return ("five_hour" in usage) is not has_session_limit(plan)
 
 
 def identity_key(email: str, org_uuid: str | None) -> str:

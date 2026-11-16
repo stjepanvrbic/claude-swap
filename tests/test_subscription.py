@@ -976,3 +976,301 @@ class TestSnapshotSourceRefresh:
         source.refresh_plans()
         source.refresh_plans()
         assert len(calls) == 2
+
+
+# --- the 5-hour limit a plan does or does not have ---------------------------
+#
+# Measured 2026-11-16 across ten accounts: every Ultra one answers
+# ``five_hour: null`` with no ``session`` entry in ``limits``, while Max 5x and
+# Team answer both. An account upgraded to Ultra keeps being handed the session
+# window that was open at the upgrade until that window resets.
+
+
+MAX_5X = {
+    "tier": "default_claude_max_5x",
+    "organizationType": "claude_max",
+    "subscriptionStatus": "active",
+    "planDisplayName": "Max 5x",
+}
+
+
+class TestHasSessionLimit:
+    @pytest.mark.parametrize(
+        "plan, limited",
+        [
+            (ULTRA, False),
+            ({"tier": "x", "planDisplayName": "ultra"}, False),
+            ({"tier": "x", "planDisplayName": " Ultra "}, False),
+            (MAX_5X, True),
+            (TEAM, True),
+            (ENTERPRISE, True),
+            (UNNAMED, True),
+            (ACTIVE_MAX, True),
+            ({"tier": "x", "planDisplayName": "Ultra Pro Deluxe"}, True),
+            (None, True),
+            ({}, True),
+        ],
+    )
+    def test_only_ultra_has_no_session_limit(self, plan, limited):
+        assert subscription.has_session_limit(plan) is limited
+
+
+class TestReadingForPlan:
+    READING = {
+        "five_hour": {"pct": 19.0, "resets_at": "2026-11-16T22:40:00+00:00"},
+        "seven_day": {"pct": 5.0},
+        "scoped": [{"name": "Fable", "pct": 6.0}],
+    }
+
+    def test_ultra_is_served_without_the_session_window(self):
+        served = subscription.reading_for_plan(self.READING, ULTRA)
+        assert "five_hour" not in served
+        assert served["seven_day"] == {"pct": 5.0}
+        assert served["scoped"] == self.READING["scoped"]
+
+    def test_the_stored_reading_is_not_mutated(self):
+        subscription.reading_for_plan(self.READING, ULTRA)
+        assert "five_hour" in self.READING
+
+    @pytest.mark.parametrize("plan", [MAX_5X, TEAM, UNNAMED, None])
+    def test_every_other_plan_keeps_its_window(self, plan):
+        assert subscription.reading_for_plan(self.READING, plan) is self.READING
+
+    def test_a_reading_without_the_window_is_returned_unchanged(self):
+        reading = {"seven_day": {"pct": 5.0}}
+        assert subscription.reading_for_plan(reading, ULTRA) is reading
+
+    @pytest.mark.parametrize("usage", [None, "re-login needed", 3])
+    def test_a_non_reading_is_returned_unchanged(self, usage):
+        assert subscription.reading_for_plan(usage, ULTRA) is usage
+
+
+class TestContradictsPlan:
+    def test_a_session_window_on_a_plan_without_one(self):
+        assert subscription.contradicts_plan({"five_hour": {"pct": 1.0}}, ULTRA)
+
+    def test_no_session_window_on_a_plan_with_one(self):
+        assert subscription.contradicts_plan({"seven_day": {"pct": 1.0}}, MAX_5X)
+
+    @pytest.mark.parametrize(
+        "usage, plan",
+        [
+            ({"five_hour": {"pct": 1.0}}, MAX_5X),
+            ({"seven_day": {"pct": 1.0}}, ULTRA),
+        ],
+    )
+    def test_agreement_is_not_a_contradiction(self, usage, plan):
+        assert not subscription.contradicts_plan(usage, plan)
+
+    @pytest.mark.parametrize("usage", [None, "re-login needed"])
+    def test_no_reading_disputes_nothing(self, usage):
+        assert not subscription.contradicts_plan(usage, ULTRA)
+
+    def test_no_record_is_not_disputed(self):
+        assert not subscription.contradicts_plan({"five_hour": {"pct": 1.0}}, None)
+
+
+def _seed_reading(switcher, usage, num="1", email="a@x", org="o1"):
+    from claude_swap.usage_store import FetchRecord
+
+    switcher._usage_store.record({num: FetchRecord(usage=usage)}, {num: (email, org)})
+
+
+class TestServedWindows:
+    """The collector hands every surface and the auto engine the same windows."""
+
+    READING = {"five_hour": {"pct": 19.0}, "seven_day": {"pct": 5.0}}
+
+    def _entry(self, switcher, plan):
+        info = [_info(1, "a@x", "o1", False, _creds("live", _future_ms()))]
+        _seed_reading(switcher, self.READING)
+        if plan is not None:
+            switcher._subscription_store().save({
+                subscription.identity_key("a@x", "o1"): {
+                    "plan": plan, "fetchedAt": switcher._usage_store.clock(),
+                }
+            })
+        return switcher._collect_usage_entries(info, fetch=set())["1"]
+
+    def test_ultra_is_served_weekly_only(self, switcher):
+        from claude_swap import oauth
+
+        entry = self._entry(switcher, ULTRA)
+        assert "five_hour" not in entry.last_good
+        assert not oauth.has_five_hour_window(entry.last_good)
+        assert [w[0] for w in oauth.relevant_windows(entry.last_good)] == ["7d"]
+
+    @pytest.mark.parametrize("plan", [MAX_5X, TEAM, None])
+    def test_a_plan_with_a_session_limit_keeps_it(self, switcher, plan):
+        entry = self._entry(switcher, plan)
+        assert entry.last_good["five_hour"] == {"pct": 19.0}
+
+    def test_the_stored_row_keeps_the_reading_as_fetched(self, switcher):
+        self._entry(switcher, ULTRA)
+        stored = switcher._usage_store.entries({"1": ("a@x", "o1")})["1"]
+        assert stored.last_good["five_hour"] == {"pct": 19.0}
+
+    def test_a_record_too_old_to_refresh_stops_deciding_limits(self, switcher):
+        """A profile endpoint that keeps refusing must not leave an Ultra
+        record hiding a 5-hour limit the account has again."""
+        info = [_info(1, "a@x", "o1", False, _creds("live", _future_ms()))]
+        _seed_reading(switcher, self.READING)
+        switcher._subscription_store().save({
+            subscription.identity_key("a@x", "o1"): {
+                "plan": ULTRA,
+                "fetchedAt": switcher._usage_store.clock(),
+                # Parked on a retry, so no pass can refresh it.
+                "retryAt": switcher._usage_store.clock() + 24 * 3600,
+            }
+        })
+        switcher._usage_store.clock.now += subscription.PLAN_TRUST_MAX_AGE_S
+
+        entry = switcher._collect_usage_entries(info, fetch=set())["1"]
+        assert entry.last_good["five_hour"] == {"pct": 19.0}
+
+    def test_a_record_inside_the_trust_age_still_decides(self, switcher):
+        info = [_info(1, "a@x", "o1", False, _creds("live", _future_ms()))]
+        _seed_reading(switcher, self.READING)
+        switcher._subscription_store().save({
+            subscription.identity_key("a@x", "o1"): {
+                "plan": ULTRA,
+                "fetchedAt": switcher._usage_store.clock(),
+                "retryAt": switcher._usage_store.clock() + 24 * 3600,
+            }
+        })
+        switcher._usage_store.clock.now += subscription.PLAN_TRUST_MAX_AGE_S - 1
+
+        entry = switcher._collect_usage_entries(info, fetch=set())["1"]
+        assert "five_hour" not in entry.last_good
+
+
+class TestTheCollectingPassKeepsThePlanCurrent:
+    """The auto engine reaches no other surface: collecting a reading has to
+    be what refreshes the plan that decides the reading's windows."""
+
+    def _info(self):
+        return [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+
+    def _record(self, switcher, plan):
+        switcher._subscription_store().save({
+            subscription.identity_key("a@x", "o1"): {
+                "plan": plan, "fetchedAt": switcher._usage_store.clock(),
+            }
+        })
+
+    @pytest.fixture(autouse=True)
+    def _no_usage_network(self, switcher, monkeypatch):
+        """These passes are about the plan: the usage row is served from the
+        store, and nothing here reaches the usage endpoint."""
+        monkeypatch.setattr(switcher, "_run_usage_fetches", lambda infos, pre: {})
+
+    def test_a_downgrade_restores_the_window_on_the_engines_own_path(
+        self, switcher, monkeypatch
+    ):
+        self._record(switcher, ULTRA)
+        _seed_reading(switcher, {"five_hour": {"pct": 99.0}, "seven_day": {"pct": 5.0}})
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(MAX_5X))
+        switcher._usage_store.clock.now += subscription.CONTRADICTED_PLAN_TTL_S
+
+        entry = switcher._collect_usage_entries(self._info())["1"]
+        assert entry.last_good["five_hour"] == {"pct": 99.0}
+
+    def test_the_refreshed_record_decides_the_same_pass_that_read_it(
+        self, switcher, monkeypatch
+    ):
+        """No pass may serve a window the plan it just read says is not there."""
+        self._record(switcher, MAX_5X)
+        _seed_reading(switcher, {"five_hour": {"pct": 19.0}, "seven_day": {"pct": 5.0}})
+        monkeypatch.setattr(subscription, "fetch_plan", lambda t, *a, **k: _ok(ULTRA))
+        switcher._usage_store.clock.now += subscription.PLAN_TTL_S
+
+        entry = switcher._collect_usage_entries(self._info())["1"]
+        assert "five_hour" not in entry.last_good
+
+    def test_a_store_only_pass_makes_no_profile_call(self, switcher, monkeypatch):
+        self._record(switcher, ULTRA)
+        _seed_reading(switcher, {"five_hour": {"pct": 19.0}})
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(MAX_5X)
+        )
+        switcher._usage_store.clock.now += 24 * 3600
+
+        switcher._collect_usage_entries(self._info(), fetch=set())
+        assert calls == []
+
+
+class TestContradictedRecordIsReread:
+    def _info(self):
+        return [_info(1, "a@x", "o1", True, _creds("live", _future_ms()))]
+
+    def _store(self, switcher, plan):
+        switcher._subscription_store().save({
+            subscription.identity_key("a@x", "o1"): {
+                "plan": plan, "fetchedAt": switcher._usage_store.clock(),
+            }
+        })
+
+    def test_an_ultra_record_whose_account_reports_a_session_window(
+        self, switcher, monkeypatch
+    ):
+        self._store(switcher, ULTRA)
+        _seed_reading(switcher, {"five_hour": {"pct": 19.0}, "seven_day": {"pct": 5.0}})
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(MAX_5X)
+        )
+        switcher._usage_store.clock.now += subscription.CONTRADICTED_PLAN_TTL_S
+        plans = switcher._collect_subscription_plans(self._info())
+        assert calls == ["live"]
+        assert plans["1"]["plan"] == MAX_5X
+
+    def test_a_record_with_a_session_limit_whose_account_reports_none(
+        self, switcher, monkeypatch
+    ):
+        self._store(switcher, MAX_5X)
+        _seed_reading(switcher, {"seven_day": {"pct": 5.0}})
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(ULTRA)
+        )
+        switcher._usage_store.clock.now += subscription.CONTRADICTED_PLAN_TTL_S
+        plans = switcher._collect_subscription_plans(self._info())
+        assert calls == ["live"]
+        assert plans["1"]["plan"] == ULTRA
+
+    def test_an_undisputed_record_waits_the_full_ttl(self, switcher, monkeypatch):
+        self._store(switcher, ULTRA)
+        _seed_reading(switcher, {"seven_day": {"pct": 5.0}})
+        calls = []
+        monkeypatch.setattr(
+            subscription, "fetch_plan", lambda t, *a, **k: calls.append(t) or _ok(MAX_5X)
+        )
+        switcher._usage_store.clock.now += subscription.CONTRADICTED_PLAN_TTL_S
+        assert switcher._collect_subscription_plans(self._info())["1"]["plan"] == ULTRA
+        assert calls == []
+
+    def test_a_contradiction_still_waits_out_a_failures_retry(
+        self, switcher, monkeypatch
+    ):
+        """A disagreement must not turn a failing profile read into one call
+        per pass: the retry the failure recorded still governs."""
+        self._store(switcher, ULTRA)
+        _seed_reading(switcher, {"five_hour": {"pct": 19.0}})
+        calls = []
+        monkeypatch.setattr(
+            subscription,
+            "fetch_plan",
+            lambda t, *a, **k: calls.append(t) or subscription.PlanFetch(),
+        )
+        switcher._usage_store.clock.now += subscription.PLAN_TTL_S
+        switcher._collect_subscription_plans(self._info())
+        assert calls == ["live"], "premise: the read was attempted and failed"
+
+        switcher._usage_store.clock.now += subscription.CONTRADICTED_PLAN_TTL_S
+        switcher._collect_subscription_plans(self._info())
+        assert calls == ["live"]
+
+        switcher._usage_store.clock.now += subscription.FAILURE_RETRY_S
+        switcher._collect_subscription_plans(self._info())
+        assert len(calls) == 2
