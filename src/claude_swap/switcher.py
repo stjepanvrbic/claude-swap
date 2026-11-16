@@ -5802,8 +5802,11 @@ class ClaudeAccountSwitcher:
         # so every caller that collects a reading — the auto engine above all,
         # which reaches no other surface — has to be a caller that keeps the
         # plan current, and the pass that refreshes a record has to be the pass
-        # that uses it. ``fetch`` carries through, so a store-only pass stays
-        # store-only. The usage pass first, because a plan read needs a valid
+        # that uses it. ``fetch`` decides eligibility exactly as
+        # ``_plans_for_pass`` reads it — an empty set is store-only, anything
+        # else lets a due record be read, whichever slots it names, since a
+        # plan is not paced by the usage endpoint's budget. The usage pass
+        # first, because a plan read needs a valid
         # access token and that is what refreshes one. A caller that wants the
         # records too asks again: a record this pass just refreshed is fresh,
         # and one it could not refresh is parked, so the second call reaches
