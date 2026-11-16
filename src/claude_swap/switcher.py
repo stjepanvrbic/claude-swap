@@ -298,6 +298,23 @@ def last_seen_note(entry: UsageEntry) -> str | None:
     )
 
 
+def _entry_for_plan(entry: UsageEntry, record: dict | None) -> UsageEntry:
+    """``entry`` served through its plan: windows the plan has, only.
+
+    The plan is the one place that knows an Ultra account has no 5-hour
+    limit, whatever window the API still reports for it (see
+    :func:`subscription.reading_for_plan`). Applied where every reading
+    leaves the collector, so no surface and no decision can read a different
+    set of windows than another. A slot with no plan record is served
+    untouched.
+    """
+    plan = record.get("plan") if isinstance(record, dict) else None
+    usage = subscription.reading_for_plan(entry.last_good, plan)
+    if usage is entry.last_good:
+        return entry
+    return dataclasses.replace(entry, last_good=usage)
+
+
 def _plan_marker(record: dict | None, now: float) -> str:
     """`` · Ultra`` after a slot's header; a lapsed subscription is a
     highlighted ``Free``. No words: a bare "expired" beside an account reads
@@ -1939,6 +1956,14 @@ class ClaudeAccountSwitcher:
         have changed. Only an already-valid access token is used; a due slot
         without one keeps its last record and is retried on the next pass.
 
+        A slot whose stored usage reading contradicts its record about the
+        5-hour limit (:func:`subscription.contradicts_plan`) is read again on
+        the shorter contradicted TTL: that disagreement is the only sign of a
+        plan change that reaches cswap without a profile read, and the record
+        now decides which windows the slot is served, not just its label. A
+        failed read still parks the slot on its ``retryAt``, so a contradiction
+        cannot turn into a tight retry loop.
+
         A read that fails, or that belongs to some other account, records when
         it may be repeated and changes nothing else. Network happens here with
         no lock held. Returns only slots that have a usable record, so a slot
@@ -1947,10 +1972,27 @@ class ClaudeAccountSwitcher:
         store = self._subscription_store()
         records = store.load()
         accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        # Stored readings as fetched, not as `_collect_usage_entries` serves
+        # them: a reading already filtered by this record could never
+        # contradict it.
+        readings = self._usage_store.entries({
+            str(num): (email, org_uuid or "")
+            for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info
+        })
         updates: dict[str, dict] = {}
         for num, email, _org_name, org_uuid, is_active, creds, _alias in accounts_info:
             key = subscription.identity_key(email, org_uuid)
-            if not subscription.is_due(records.get(key), store.clock()):
+            record = records.get(key)
+            entry = readings.get(str(num))
+            ttl = (
+                subscription.CONTRADICTED_PLAN_TTL_S
+                if subscription.contradicts_plan(
+                    entry.last_good if entry else None,
+                    record.get("plan") if isinstance(record, dict) else None,
+                )
+                else subscription.PLAN_TTL_S
+            )
+            if not subscription.is_due(record, store.clock(), ttl):
                 continue
             token = subscription.usable_access_token(creds)
             if token is None and not is_active:
@@ -5743,8 +5785,14 @@ class ClaudeAccountSwitcher:
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
+        # Served through the plan: a window the account's plan does not have
+        # (an Ultra account's leftover session window) gates nothing, and the
+        # stored row keeps the reading as fetched.
+        plans = self._stored_subscription_plans(accounts_info)
         return {
-            num: with_sentinel(entries[num], sentinels.get(num))
+            num: with_sentinel(
+                _entry_for_plan(entries[num], plans.get(num)), sentinels.get(num)
+            )
             for num in info_by_num
         }
 
