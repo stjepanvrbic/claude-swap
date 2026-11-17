@@ -298,26 +298,6 @@ def last_seen_note(entry: UsageEntry) -> str | None:
     )
 
 
-def _entry_for_plan(
-    entry: UsageEntry, record: dict | None, now: float
-) -> UsageEntry:
-    """``entry`` served through its plan: windows the plan has, only.
-
-    The plan is the one place that knows an Ultra account has no 5-hour
-    limit, whatever window the API still reports for it (see
-    :func:`subscription.reading_for_plan`). Applied where every reading
-    leaves the collector, so no surface and no decision can read a different
-    set of windows than another. A slot with no plan record, or one too old
-    to decide limits (:func:`subscription.windows_plan`), is served untouched.
-    """
-    usage = subscription.reading_for_plan(
-        entry.last_good, subscription.windows_plan(record, now)
-    )
-    if usage is entry.last_good:
-        return entry
-    return dataclasses.replace(entry, last_good=usage)
-
-
 def _plan_marker(record: dict | None, now: float) -> str:
     """`` · Ultra`` after a slot's header; a lapsed subscription is a
     highlighted ``Free``. No words: a bare "expired" beside an account reads
@@ -1959,14 +1939,6 @@ class ClaudeAccountSwitcher:
         have changed. Only an already-valid access token is used; a due slot
         without one keeps its last record and is retried on the next pass.
 
-        A slot whose stored usage reading contradicts its record about the
-        5-hour limit (:func:`subscription.contradicts_plan`) is read again on
-        the shorter contradicted TTL: that disagreement is the only sign of a
-        plan change that reaches cswap without a profile read, and the record
-        now decides which windows the slot is served, not just its label. A
-        failed read still parks the slot on its ``retryAt``, so a contradiction
-        cannot turn into a tight retry loop.
-
         A read that fails, or that belongs to some other account, records when
         it may be repeated and changes nothing else. Network happens here with
         no lock held. Returns only slots that have a usable record, so a slot
@@ -1975,27 +1947,10 @@ class ClaudeAccountSwitcher:
         store = self._subscription_store()
         records = store.load()
         accounts = (self._get_sequence_data() or {}).get("accounts", {})
-        # Stored readings as fetched, not as `_collect_usage_entries` serves
-        # them: a reading already filtered by this record could never
-        # contradict it.
-        readings = self._usage_store.entries({
-            str(num): (email, org_uuid or "")
-            for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info
-        })
         updates: dict[str, dict] = {}
         for num, email, _org_name, org_uuid, is_active, creds, _alias in accounts_info:
             key = subscription.identity_key(email, org_uuid)
-            record = records.get(key)
-            entry = readings.get(str(num))
-            ttl = (
-                subscription.CONTRADICTED_PLAN_TTL_S
-                if subscription.contradicts_plan(
-                    entry.last_good if entry else None,
-                    record.get("plan") if isinstance(record, dict) else None,
-                )
-                else subscription.PLAN_TTL_S
-            )
-            if not subscription.is_due(record, store.clock(), ttl):
+            if not subscription.is_due(records.get(key), store.clock()):
                 continue
             token = subscription.usable_access_token(creds)
             if token is None and not is_active:
@@ -5677,11 +5632,6 @@ class ClaudeAccountSwitcher:
         the same plan. A failed fetch only updates the entry's error/backoff
         fields, so the last-good measurement keeps being served
         (stale-on-error).
-
-        Readings leave here served through their subscription plan, which the
-        pass refreshes on the same ``fetch`` eligibility — the plan decides
-        which windows a reading carries, so no path may collect a reading
-        without keeping the plan behind it current.
         """
         store = self._usage_store
         identities = {
@@ -5793,31 +5743,8 @@ class ClaudeAccountSwitcher:
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
-        # Served through the plan: a window the account's plan does not have
-        # (an Ultra account's leftover session window) gates nothing, and the
-        # stored row keeps the reading as fetched.
-        #
-        # Refreshed here, after the usage pass, rather than read from the
-        # store: the plan now decides which windows a reading is served with,
-        # so every caller that collects a reading — the auto engine above all,
-        # which reaches no other surface — has to be a caller that keeps the
-        # plan current, and the pass that refreshes a record has to be the pass
-        # that uses it. ``fetch`` decides eligibility exactly as
-        # ``_plans_for_pass`` reads it — an empty set is store-only, anything
-        # else lets a due record be read, whichever slots it names, since a
-        # plan is not paced by the usage endpoint's budget. The usage pass
-        # first, because a plan read needs a valid
-        # access token and that is what refreshes one. A caller that wants the
-        # records too asks again: a record this pass just refreshed is fresh,
-        # and one it could not refresh is parked, so the second call reaches
-        # the network for nothing it did not already try.
-        plans = self._plans_for_pass(accounts_info, fetch)
-        now = store.clock()
         return {
-            num: with_sentinel(
-                _entry_for_plan(entries[num], plans.get(num), now),
-                sentinels.get(num),
-            )
+            num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
         }
 
